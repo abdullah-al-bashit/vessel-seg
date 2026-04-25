@@ -8,7 +8,7 @@ from skimage.transform import resize
 
 TILE_W  = 1024
 TILE_H  = 1300   # full strip height — no vertical cuts
-STRIDE  = 256    # horizontal stride only
+STRIDE  = 512    # horizontal stride only
 
 
 # ── Normalization ──────────────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ def tile_image(img, mask=None):
     # Horizontal tile positions
     xs = list(range(0, max(W - tw, 1), STRIDE))
     if not xs or xs[-1] + tw < W:
-        xs.append(max(W - tw, 0))               # flush-right tile
+        xs.append(W - tw)               # flush-right tile
 
     tiles = []
     for x in xs:
