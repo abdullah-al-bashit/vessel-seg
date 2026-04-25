@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data — never commit raw images or masks
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+
+# Model weights — too large for git
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Predictions output
+predictions/
+
+# Logs
+logs/
+*.out
+*.err
+
+# HuggingFace cache
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
