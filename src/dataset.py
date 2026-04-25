@@ -8,7 +8,7 @@ from skimage.transform import resize
 
 TILE_W  = 1024
 TILE_H  = 1300   # full strip height — no vertical cuts
-STRIDE  = 512    # horizontal stride only
+STRIDE  = 256    # horizontal stride only
 
 
 # ── Normalization ──────────────────────────────────────────────────────────────
