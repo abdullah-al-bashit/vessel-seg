@@ -92,8 +92,8 @@ def main(args):
         train_pairs = [pairs[i] for i in train_idx]
         val_pairs   = [pairs[i] for i in val_idx]
 
-        train_ds = VesselDataset(train_pairs, augment=True)
-        val_ds   = VesselDataset(val_pairs,   augment=False)
+        train_ds = VesselDataset(train_pairs, augment=True,  seed=42)
+        val_ds   = VesselDataset(val_pairs,   augment=False, seed=42)
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                   shuffle=True,  num_workers=4, pin_memory=True)

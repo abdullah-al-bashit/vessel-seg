@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import Dataset
 from tifffile import imread
 from skimage.transform import resize
+from scipy.ndimage import map_coordinates, gaussian_filter
 
 TILE_W  = 1024
 TILE_H  = 1300   # full strip height — no vertical cuts
@@ -137,8 +138,9 @@ class VesselDataset(Dataset):
     Each (image, mask) pair is pre-tiled; all tiles stored in memory.
     For 30 images × ~30 tiles = ~900 items.
     """
-    def __init__(self, pairs, augment=False):
+    def __init__(self, pairs, augment=False, seed=None):
         self.augment = augment
+        self.seed    = seed   # None → random each call; int → reproducible per idx
         self.items   = []                        # (img_tile, msk_tile, hann)
 
         hann = hanning_weight(TILE_H, TILE_W).astype(np.float32)
@@ -169,7 +171,10 @@ class VesselDataset(Dataset):
         img, msk, hann = self.items[idx]
 
         if self.augment:
-            img, msk = _augment(img, msk)
+            # Seed derived from base seed + idx so each sample is independently
+            # reproducible; None falls through to a random RNG inside _augment.
+            rng = np.random.default_rng(self.seed + idx) if self.seed is not None else None
+            img, msk = _augment(img, msk, rng=rng)
 
         # img: (H, W) uint8 → float32 tensor (1, H, W)
         img_t  = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
@@ -181,22 +186,75 @@ class VesselDataset(Dataset):
 
 # ── Augmentation ───────────────────────────────────────────────────────────────
 
-def _augment(img, msk):
-    """Geometric augmentations only — no intensity changes."""
+def _augment(img, msk, rng=None):
+    """Geometric and intensity augmentations for vessel segmentation.
+
+    rng: np.random.Generator — pass a seeded Generator for reproducibility,
+         or None to draw a fresh random one each call.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    h, w = img.shape[:2]
+
+    # ── Geometric ──────────────────────────────────────────────────────────────
     # Random horizontal flip
-    if np.random.rand() > 0.5:
+    if rng.random() > 0.5:
         img = np.fliplr(img).copy()
         msk = np.fliplr(msk).copy()
 
     # Random vertical flip
-    if np.random.rand() > 0.5:
+    if rng.random() > 0.5:
         img = np.flipud(img).copy()
         msk = np.flipud(msk).copy()
 
-    # Random 90° rotation
-    k = np.random.randint(0, 4)
+    # Random 90° rotation (k ∈ {1, 2, 3})
+    k = rng.integers(0, 4)
     if k > 0:
         img = np.rot90(img, k).copy()
         msk = np.rot90(msk, k).copy()
+
+    # Random zoom-in: crop a random sub-region then resize back to original shape.
+    # order=0 for mask preserves binary labels without interpolation artifacts.
+    if rng.random() > 0.5:
+        scale = rng.uniform(0.75, 1.0)
+        ch, cw = int(h * scale), int(w * scale)
+        y0 = rng.integers(0, h - ch + 1)
+        x0 = rng.integers(0, w - cw + 1)
+        img = resize(img[y0:y0+ch, x0:x0+cw], (h, w),
+                     preserve_range=True, anti_aliasing=True).astype(np.uint8)
+        msk = resize(msk[y0:y0+ch, x0:x0+cw], (h, w),
+                     order=0, preserve_range=True, anti_aliasing=False).astype(msk.dtype)
+
+    # Elastic deformation: smooth random displacement field mimics vessel curvature variation.
+    # alpha controls deformation magnitude, sigma controls smoothness.
+    # Mask uses order=0 to avoid introducing fractional label values.
+    if rng.random() > 0.7:
+        alpha = h * rng.uniform(0.5, 2.0)
+        sigma = h * 0.08
+        dx = gaussian_filter(rng.standard_normal((h, w)), sigma) * alpha
+        dy = gaussian_filter(rng.standard_normal((h, w)), sigma) * alpha
+        xs, ys = np.meshgrid(np.arange(w), np.arange(h))
+        coords = [np.clip(ys + dy, 0, h - 1), np.clip(xs + dx, 0, w - 1)]
+        img = map_coordinates(img, coords, order=1, mode='reflect').astype(img.dtype)
+        msk = map_coordinates(msk, coords, order=0, mode='reflect').astype(msk.dtype)
+
+    # ── Intensity ──────────────────────────────────────────────────────────────
+    # Gaussian noise: simulates sensor noise; only applied to image, not mask.
+    if rng.random() > 0.5:
+        sigma_n = rng.uniform(2, 12)
+        noise = rng.normal(0, sigma_n, img.shape).astype(np.float32)
+        img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    # Brightness / contrast jitter: alpha scales contrast, beta shifts brightness.
+    if rng.random() > 0.5:
+        alpha = rng.uniform(0.7, 1.4)          # contrast
+        beta  = rng.integers(-25, 25)           # brightness
+        img = np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
+
+    # Gamma correction: nonlinear brightness shift, robust to illumination changes.
+    if rng.random() > 0.5:
+        gamma = rng.uniform(0.5, 1.8)
+        img = (255.0 * (img.astype(np.float32) / 255.0) ** gamma).astype(np.uint8)
 
     return img, msk
