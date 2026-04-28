@@ -1,6 +1,6 @@
 import os
 import argparse
-import random
+import random  # used in set_seed
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,13 +25,6 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark     = False # disable auto-tuner (picks different algos each run)
 
 
-def worker_init_fn(_):
-    # Each DataLoader worker inherits the parent's RNG state — give each a unique seed.
-    seed = torch.initial_seed() % 2**32
-    np.random.seed(seed)
-    random.seed(seed)
-
-
 # ── Dice metric ────────────────────────────────────────────────────────────────
 
 def dice_score(pred_bin, target):
@@ -50,6 +43,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True):
     total_parts = {'dice': 0.0, 'bce': 0.0, 'cldice': 0.0}
 
     use_amp = device.type == 'cuda'
+    # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
         for img, msk, hann in tqdm(loader, leave=False):
@@ -64,15 +58,15 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True):
             if train:
                 optimizer.zero_grad()
                 if use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)  # unscale before grad clip so clip threshold is meaningful
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(loss).backward()       # scale loss to prevent float16 underflow, then backprop
+                    scaler.unscale_(optimizer)          # restore true gradient magnitudes before clipping
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # prevent gradient explosion
+                    scaler.step(optimizer)              # skips update if gradients contain inf/nan
+                    scaler.update()                     # adjust scale factor for next iteration
                 else:
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    loss.backward()                                        # compute gradients
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # prevent gradient explosion
+                    optimizer.step()                                       # update weights
 
             pred_bin = (torch.sigmoid(logits) > 0.5)
             total_dice += dice_score(pred_bin, msk.bool())
@@ -120,10 +114,10 @@ def main(args):
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                   shuffle=True,  num_workers=4, pin_memory=True,
-                                  worker_init_fn=worker_init_fn, persistent_workers=True)
+                                  persistent_workers=True)
         val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                                   shuffle=False, num_workers=4, pin_memory=True,
-                                  worker_init_fn=worker_init_fn, persistent_workers=True)
+                                  persistent_workers=True)
 
         model     = VesselSegNet().to(device)
         criterion = VesselLoss(lambda_cldice=0.5)
@@ -182,7 +176,7 @@ def main(args):
     test_ds     = VesselDataset(test_pairs, augment=False, seed=42)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size,
                              shuffle=False, num_workers=4, pin_memory=True,
-                             worker_init_fn=worker_init_fn, persistent_workers=True)
+                             persistent_workers=True)
 
     model = VesselSegNet().to(device)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
