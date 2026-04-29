@@ -13,10 +13,17 @@ from dataset import load_pairs, VesselDataset
 from model   import VesselSegNet
 from loss    import VesselLoss
 
+SEED          = 42   # single source of truth for all random seeds throughout training
+N_FOLDS       = 5    # number of cross-validation folds
+TEST_SPLIT    = 0.2  # fraction of pairs held out as final test set
+PATIENCE      = 30   # early stopping: epochs without val loss improvement before stopping
+LAMBDA_CLDICE = 0.5  # weight of clDice term in VesselLoss (total = soft_dice + bce + λ·cldice)
+NUM_WORKERS   = 4    # DataLoader worker processes for parallel data loading
+
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
 
-def set_seed(seed=42):
+def set_seed(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -25,28 +32,18 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark     = False # disable auto-tuner (picks different algos each run)
 
 
-# ── Dice metric ────────────────────────────────────────────────────────────────
-
-def dice_score(pred_bin, target):
-    """pred_bin, target: (B, 1, H, W) bool tensors"""
-    inter = (pred_bin & target).float().sum()
-    denom = pred_bin.float().sum() + target.float().sum()
-    return (2.0 * inter / (denom + 1e-6)).item()
-
-
 # ── One epoch ─────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True):
     model.train(train)
     total_loss  = 0.0
-    total_dice  = 0.0
     total_parts = {'dice': 0.0, 'bce': 0.0, 'cldice': 0.0}
 
     use_amp = device.type == 'cuda'
     # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for img, msk, hann in tqdm(loader, leave=False):
+        for img, msk, hann in tqdm(loader):  # batch loop — each iteration yields (B, 1, H, W) tensors
             img  = img.to(device)
             msk  = msk.to(device)
             hann = hann.to(device)
@@ -58,69 +55,75 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True):
             if train:
                 optimizer.zero_grad()
                 if use_amp:
-                    scaler.scale(loss).backward()       # scale loss to prevent float16 underflow, then backprop
-                    scaler.unscale_(optimizer)          # restore true gradient magnitudes before clipping
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # prevent gradient explosion
-                    scaler.step(optimizer)              # skips update if gradients contain inf/nan
-                    scaler.update()                     # adjust scale factor for next iteration
+                    scaler.scale(loss).backward()       # multiply loss by scale factor, then backprop to keep float16 gradients from flushing to zero
+                    scaler.unscale_(optimizer)          # divide gradients back by scale factor so clip operates on true magnitudes
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # cap gradient norm to avoid exploding updates
+                    scaler.step(optimizer)              # update weights; skips entire step if any gradient is inf/nan
+                    scaler.update()                     # increase scale factor if step was taken, decrease if inf/nan was detected
                 else:
                     loss.backward()                                        # compute gradients
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # prevent gradient explosion
                     optimizer.step()                                       # update weights
 
-            pred_bin = (torch.sigmoid(logits) > 0.5)
-            total_dice += dice_score(pred_bin, msk.bool())
-            total_loss += loss.item()
+            total_loss += loss.item()                      # scalar float — .item() detaches from graph
             for k in total_parts:
-                total_parts[k] += loss_dict[k]
+                total_parts[k] += loss_dict[k]  # scalar float — loss_dict values are already Python floats via .item() in VesselLoss
 
-    n = len(loader)
-    parts = {k: v / n for k, v in total_parts.items()}
-    return total_loss / n, total_dice / n, parts
+    n = len(loader)                                        # number of batches in the epoch
+    parts = {k: v / n for k, v in total_parts.items()}    # per-sub-loss epoch averages
+    return total_loss / n, parts                           # epoch-averaged total loss and sub-losses
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(args):
-    set_seed(42)
+    set_seed(SEED)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
     # Load all annotated pairs
-    pairs = load_pairs(args.input_dir, args.output_dir)
+    pairs = load_pairs(args.input_dir, args.output_dir)  # e.g. [('data/1_img.tif', 'data/1_msk.tif'), ('data/2_img.tif', 'data/2_msk.tif'), ...]
     print(f'Annotated pairs found: {len(pairs)}')
 
     # Hold out 20% as a final test set — evaluated once after all CV folds,
     # never used during training or model selection to avoid optimism bias.
-    trainval_pairs, test_pairs = train_test_split(pairs, test_size=0.2, random_state=42)
+    trainval_pairs, test_pairs = train_test_split(pairs, test_size=TEST_SPLIT, random_state=SEED)
+    # e.g. pairs=30 → trainval_pairs=[('1_img.tif','1_msk.tif'), ...] (24 items), test_pairs=[('7_img.tif','7_msk.tif'), ...] (6 items)
     print(f'Train+val pairs: {len(trainval_pairs)}  |  Test pairs: {len(test_pairs)}')
 
     # 5-fold CV on image-level pairs (not tile-level) to avoid data leakage
-    kf           = KFold(n_splits=5, shuffle=True, random_state=42)
-    pair_indices = list(range(len(trainval_pairs)))
-    best_dice_folds = []
+    kf           = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)  # splitter object — actual split happens at kf.split() below
+    pair_indices = list(range(len(trainval_pairs)))  # e.g. [0, 1, 2, ..., 23] for 24 trainval pairs
+    best_loss_folds = []                             # best val loss per fold — used to select fold for test evaluation
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(pair_indices)):
-        # Reset seed per fold so each fold's model initialises from the same state.
-        set_seed(42 + fold)
-        print(f'\n═══ Fold {fold+1}/5 ═══')
+        # kf.split yields 5 rounds; each round rotates which 1/5 of pair_indices is val_idx,
+        # the other 4/5 become train_idx — e.g. fold 0: val_idx=[0..4], train_idx=[5..23]
 
-        train_pairs = [trainval_pairs[i] for i in train_idx]
-        val_pairs   = [trainval_pairs[i] for i in val_idx]
+        # reset RNG so every fold's model starts from the same weight initialisation
+        set_seed(SEED + fold)
+        print(f'\n═══ Fold {fold+1}/{N_FOLDS} ═══')
 
-        train_ds = VesselDataset(train_pairs, augment=True,  seed=42)
-        val_ds   = VesselDataset(val_pairs,   augment=False, seed=42)
+        # map integer indices back to actual (img_path, msk_path) tuples
+        train_pairs = [trainval_pairs[i] for i in train_idx]  # e.g. 19 pairs
+        val_pairs   = [trainval_pairs[i] for i in val_idx]    # e.g. 5 pairs
+
+        # tile each pair; train set gets augmentation, val set does not
+        train_ds = VesselDataset(train_pairs, augment=True,  seed=SEED)
+        val_ds   = VesselDataset(val_pairs,   augment=False, seed=SEED)
         print(f'  Train tiles: {len(train_ds)}  |  Val tiles: {len(val_ds)}')
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                  shuffle=True,  num_workers=4, pin_memory=True,
-                                  persistent_workers=True)
+                                  shuffle=True,  num_workers=NUM_WORKERS,
+                                  pin_memory=True,         # allocates batches in CPU memory that the GPU can read directly, avoiding an extra copy
+                                  persistent_workers=True) # keeps worker processes alive between epochs so they don't need to be spawned again each epoch
         val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                                  shuffle=False, num_workers=4, pin_memory=True,
+                                  shuffle=False, num_workers=NUM_WORKERS,
+                                  pin_memory=True,
                                   persistent_workers=True)
 
         model     = VesselSegNet().to(device)
-        criterion = VesselLoss(lambda_cldice=0.5)
+        criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE)
         scaler    = GradScaler() if device.type == 'cuda' else None
 
         # Only train decoder + graph net — encoder is frozen inside model
@@ -129,64 +132,63 @@ def main(args):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6)
 
-        best_dice  = 0.0
-        # Patience of 30: cosine LR needs time to decay before judging convergence.
-        patience   = 30
-        no_improve = 0
+        best_loss  = float('inf')  # best val loss this fold (full VesselLoss = soft_dice + bce + cldice)
+        no_improve = 0             # counter — resets to 0 whenever val loss improves, increments otherwise
 
         for epoch in range(1, args.epochs + 1):
-            train_ds.seed = 42 + epoch  # vary augmentations each epoch
+            train_ds.seed = SEED + epoch  # vary augmentations each epoch
 
-            tr_loss, tr_dice, tr_parts = run_epoch(model, train_loader, criterion,
-                                                    optimizer, scaler, device, train=True)
-            va_loss, va_dice, va_parts = run_epoch(model, val_loader,   criterion,
-                                                    None,      None,   device, train=False)
+            tr_loss, tr_parts = run_epoch(model, train_loader, criterion,
+                                          optimizer, scaler, device, train=True)
+            va_loss, va_parts = run_epoch(model, val_loader,   criterion,
+                                          None,    None,       device, train=False)
             scheduler.step()
 
             print(f'Epoch {epoch:3d} | '
-                  f'train loss {tr_loss:.4f} dice {tr_dice:.4f} '
-                  f'(d={tr_parts["dice"]:.3f} b={tr_parts["bce"]:.3f} cl={tr_parts["cldice"]:.3f}) | '
-                  f'val   loss {va_loss:.4f} dice {va_dice:.4f} '
-                  f'(d={va_parts["dice"]:.3f} b={va_parts["bce"]:.3f} cl={va_parts["cldice"]:.3f})')
+                  f'train loss {tr_loss:.4f} '
+                  f'(soft_dice={tr_parts["dice"]:.3f} bce={tr_parts["bce"]:.3f} cldice={tr_parts["cldice"]:.3f}) | '
+                  f'val   loss {va_loss:.4f} '
+                  f'(soft_dice={va_parts["dice"]:.3f} bce={va_parts["bce"]:.3f} cldice={va_parts["cldice"]:.3f})')
 
-            if va_dice > best_dice:
-                best_dice  = va_dice
+            # model selection and early stopping based on full val loss (VesselLoss)
+            if va_loss < best_loss:
+                best_loss  = va_loss
                 no_improve = 0
                 ckpt_path  = os.path.join(args.ckpt_dir, f'fold{fold+1}_best.pth')
                 torch.save(model.state_dict(), ckpt_path)
-                print(f'  ✓ saved {ckpt_path}  (dice {best_dice:.4f})')
+                print(f'  ✓ saved {ckpt_path}  (val loss {best_loss:.4f})')
             else:
                 no_improve += 1
-                if no_improve >= patience:
+                if no_improve >= PATIENCE:
                     print(f'  Early stopping at epoch {epoch}')
                     break
 
-        best_dice_folds.append(best_dice)
-        print(f'Fold {fold+1} best val Dice: {best_dice:.4f}')
+        best_loss_folds.append(best_loss)
+        print(f'Fold {fold+1} best val loss: {best_loss:.4f}')
 
-    print(f'\n5-fold CV Dice: {np.mean(best_dice_folds):.4f} '
-          f'± {np.std(best_dice_folds):.4f}')
+    print(f'\n5-fold CV val loss: {np.mean(best_loss_folds):.4f} '
+          f'± {np.std(best_loss_folds):.4f}')
 
     # ── Final test evaluation ──────────────────────────────────────────────────
-    # Load the best fold's checkpoint and evaluate once on the held-out test set.
-    best_fold = int(np.argmax(best_dice_folds)) + 1
-    print(f'\nEvaluating fold {best_fold} (best CV) on held-out test set ...')
-    set_seed(42)
+    # Load the fold with the lowest val loss and evaluate once on the held-out test set.
+    best_fold = int(np.argmin(best_loss_folds)) + 1
+    print(f'\nEvaluating fold {best_fold} (lowest val loss) on held-out test set ...')
+    set_seed(SEED)
 
-    test_ds     = VesselDataset(test_pairs, augment=False, seed=42)
+    test_ds     = VesselDataset(test_pairs, augment=False, seed=SEED)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size,
-                             shuffle=False, num_workers=4, pin_memory=True,
+                             shuffle=False, num_workers=NUM_WORKERS, pin_memory=True,
                              persistent_workers=True)
 
     model = VesselSegNet().to(device)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
                                      map_location=device))
-    criterion = VesselLoss(lambda_cldice=0.5)
+    criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE)
 
-    te_loss, te_dice, te_parts = run_epoch(model, test_loader, criterion,
-                                            None, None, device, train=False)
-    print(f'Test  loss {te_loss:.4f} dice {te_dice:.4f} '
-          f'(d={te_parts["dice"]:.3f} b={te_parts["bce"]:.3f} cl={te_parts["cldice"]:.3f})')
+    te_loss, te_parts = run_epoch(model, test_loader, criterion,
+                                   None, None, device, train=False)
+    print(f'Test loss {te_loss:.4f} '
+          f'(soft_dice={te_parts["dice"]:.3f} bce={te_parts["bce"]:.3f} cldice={te_parts["cldice"]:.3f})')
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
