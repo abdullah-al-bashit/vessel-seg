@@ -11,25 +11,35 @@ import sknw                                              # skeleton → networkx
 HF_MODEL_ID = "facebook/sam2.1-hiera-large"             # SAM2.1 Hiera-Large — newest checkpoint on HuggingFace
 
 # ── Feature dimensions ─────────────────────────────────────────────────────────
-# Node features (42 total):
-#   [0]   x_norm              normalized x position ∈ [0,1]
-#   [1]   y_norm              normalized y position ∈ [0,1]
-#   [2]   cos(θ)              vessel orientation cos ∈ [-1,1]
-#   [3]   sin(θ)              vessel orientation sin ∈ [-1,1]  (anisotropic pair)
-#   [4]   diameter            local vessel width ∈ [0,1]        fixes broken thin vessels
-#   [5]   curvature κ         bending rate at node              fixes bifurcation errors
-#   [6]   degree              number of branches at node        detects endpoints/bifurcations/false blobs
-#   [7]   component_size      normalized size of vessel network isolates false positive blobs
-#   [8]   endpoint_distance   normalized dist to nearest tip    locates break-prone positions
-#   [9]   diameter_consistency std of diameter along all edges  flags sudden width changes
-#   [10-41] CNN features (32) local appearance from decoder     pixel-level evidence
+# Node features (39 total):
+#   [0]   cos(θ)              vessel orientation cos ∈ [-1,1]
+#   [1]   sin(θ)              vessel orientation sin ∈ [-1,1]  (anisotropic pair)
+#   [2]   diameter            local vessel width ∈ [0,1]        fixes broken thin vessels
+#   [3]   curvature κ         bending rate per edge ∈ [0,1]     fixes bifurcation errors
+#   [4]   degree              number of branches at node        detects endpoints/bifurcations/false blobs
+#   [5]   component_size      normalized size of vessel network isolates false positive blobs
+#   [6]   diameter_consistency std of diameter along all edges  flags sudden width changes
+#   [7-38] CNN features (32)  local appearance from decoder     pixel-level evidence
+#
+# ── Worked example: 3-way junction node on a 1024×1024 tile ──────────────────
+#   Vessel is ~20 px wide; three edges point right, up, and down.
+#
+#   idx  feature            value    derivation
+#   [0]  cos_theta         +0.330    mean(cos) of 3 edges: right(+1)+up(0)+dn(0) / 3
+#   [1]  sin_theta          0.000    mean(sin) of 3 edges: 0 + (−1) + (+1) / 3 = 0
+#   [2]  d_norm             0.020    dist[y,x]=10 → 10×2/1024
+#   [3]  kappa              0.570    see κ example above (sum=1.71, degree=3 → 1.71/3)
+#   [4]  deg_norm           0.750    degree=3 → 3/4
+#   [5]  comp_norm          1.000    node belongs to the largest component
+#   [6]  diam_std           0.050    CoV of radii along all edges
+#   [7-38] 32 CNN floats            pixel_feats_np[y, x]  (local appearance)
 #
 # Edge features (4 total):
 #   [0]   length_norm         normalized path length            vessel segment size
 #   [1]   gap_intensity_mean  mean image brightness along path  detects real vs phantom vessels
 #   [2]   gap_intensity_std   std of brightness along path      consistent signal = real vessel
 #   [3]   delta_theta         angle difference between nodes    detects false branches at bifurcations
-NODE_FEAT_DIM = 42   # 10 geometric/topological + 32 CNN
+NODE_FEAT_DIM = 39   # 7 geometric/topological + 32 CNN
 EDGE_FEAT_DIM = 4    # 4 edge descriptors
 
 
@@ -140,8 +150,8 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
                                        e.g. N=3 nodes → [[512, 200], [530, 350], [480, 500]]
                                             x=512,y=200  x=530,y=350  x=480,y=500
 
-        node_feats: (N, NODE_FEAT_DIM) 42-dim feature vector per node
-                                       e.g. N=3 → shape (3, 42); row 0 = features of node 0
+        node_feats: (N, NODE_FEAT_DIM) 41-dim feature vector per node
+                                       e.g. N=3 → shape (3, 41); row 0 = features of node 0
 
         edge_index: (2, E)             directed edge list for all E edges (each undirected edge stored twice)
                                        row 0 = source indices, row 1 = destination indices
@@ -238,9 +248,9 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
     #   row\col  0    1    2    3    4    5    6    7    8
     #      0     F    F    F    F    F    F    F    F    F    ← all background
     #      1     F    F    F    F    F    F    F    F    F    ← all background
-    #      2     F    F    T    T    T    T    T    F    F    ← vessel top edge
-    #      3     F    F    T    T    T    T    T    F    F    ← vessel middle row (skeleton)
-    #      4     F    F    T    T    T    T    T    F    F    ← vessel bottom edge
+    #      2     F    F  [ T    T    T    T    T ]  F    F    ← vessel top edge
+    #      3     F    F  [ T    T    T    T    T ]  F    F    ← vessel middle row (skeleton)
+    #      4     F    F  [ T    T    T    T    T ]  F    F    ← vessel bottom edge
     #      5     F    F    F    F    F    F    F    F    F    ← all background
     #      6     F    F    F    F    F    F    F    F    F    ← all background
     #
@@ -249,42 +259,35 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
     #   row\col  0    1    2    3    4    5    6    7    8
     #      0     0    0    0    0    0    0    0    0    0
     #      1     0    0    0    0    0    0    0    0    0
-    #      2     0    0    1    1    1    1    1    0    0    ← 1 step from background
-    #      3     0    0    1    2    2    2    1    0    0    ← center row: dist=2 (vessel radius=2)
-    #      4     0    0    1    1    1    1    1    0    0    ← 1 step from background
+    #      2     0    0  [ 1    1    1    1    1 ]  0    0    ← 1 step from background
+    #      3     0    0  [ 1    2    2    2    1 ]  0    0    ← center row: dist=2 (vessel radius=2)
+    #      4     0    0  [ 1    1    1    1    1 ]  0    0    ← 1 step from background
     #      5     0    0    0    0    0    0    0    0    0
     #      6     0    0    0    0    0    0    0    0    0
     #
     #   skeleton runs along row=3 (the row of maximum dist values);
-    #   skeleton pixels at (3,3), (3,4), (3,5) all have dist=2 = vessel radius
-    #   diameter = 2 × dist = 4 pixels  (≈ vessel width, here exactly 4 rows wide including edges)
+    #   skeleton pixels at (3,3), (3,4), (3,5) all have dist=2 = rows to nearest background
+    #   diameter = 2 × dist = 4  (background-row gap: row 5 − row 1 = 4; actual vessel
+    #   pixel count = 3 rows 2-4; ×2 mirrors the radius symmetrically to both sides)
     #
     #   corner pixels such as (2,2) get dist=1 because the nearest background pixel is
     #   directly above (1,2) or directly left (2,1), both 1 step away — Euclidean distance
     #   takes the shortest path in 2D, not just along rows or columns
 
     # ── Pre-compute connected components for component_size feature ────────
-    # component_size: how large is the vessel network this node belongs to?
-    # Large component = real vessel network. Small isolated component = likely false positive.
-    components      = list(nx.connected_components(graph))           # list of sets of node IDs
-    node_to_comp    = {}                                             # dict: node_id → component index
-    for ci, comp in enumerate(components):
-        for nid in comp:
-            node_to_comp[nid] = ci
-    comp_sizes      = [len(c) for c in components]                  # list of int — node count per component
-    max_comp_size   = max(comp_sizes) if comp_sizes else 1          # scalar int — largest component size for normalization
-
-    # ── Pre-compute endpoint nodes for endpoint_distance feature ───────────
-    # Endpoints = nodes with degree 1 (vessel tips). These are break-prone positions.
-    # Nodes close to an endpoint are more likely to be near a real break.
-    endpoint_nodes  = [n for n in nodes if graph.degree(n) == 1]    # list of node IDs with degree=1
-    endpoint_pos    = np.array(
-        [graph.nodes[n]['o'] for n in endpoint_nodes], dtype=np.float32
-    ) if endpoint_nodes else None                                    # (n_endpoints, 2) float32 or None
+    # Each connected component = one isolated vessel subgraph in this tile.
+    # Large → real vessel network; small / isolated → likely spurious blob.
+    components   = list(nx.connected_components(graph))    # list[set[int]], length C ≤ N — e.g. [{0,1,2}, {3}]
+    node_to_comp = {}                                       # dict[int,int], N entries — e.g. {0:0, 1:0, 2:0, 3:1}
+    for ci, comp in enumerate(components):  # ci = component index 0,1,...,C-1; comp = set of node IDs in it
+        for nid in comp:                     # flatten: stamp every node in this component with its index ci
+            node_to_comp[nid] = ci           # e.g. nodes 0,1,2 → ci=0; node 3 → ci=1
+    comp_sizes    = [len(c) for c in components]           # list[int], length C — e.g. [3, 1]
+    max_comp_size = max(comp_sizes) if comp_sizes else 1   # int — e.g. 3; comp_norm = comp_sizes[ci] / 3 → [0,1]
 
     # ── Build node features ────────────────────────────────────────────────
-    node_pos   = []    # will become (N, 2)              float32 — (x, y) pixel coords
-    node_feats = []    # will become (N, NODE_FEAT_DIM)  float32 — feature vectors
+    node_pos   = []    # list[list[float,float]]; one [x=col, y=row] per node → np.array → (N, 2) float32
+    node_feats = []    # list[ndarray(39,)];     one 39-dim vec  per node → np.array → (N, 39) float32
 
     for n in nodes:
         y, x = graph.nodes[n]['o']                   # (2,) — skeleton node position as (row, col)
@@ -292,31 +295,157 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         y = np.clip(y, 0, H - 1)                     # scalar int — row clamped to valid range
         x = np.clip(x, 0, W - 1)                     # scalar int — col clamped to valid range
 
-        # ── Feature 1-2: normalized position ──────────────────────────────
-        x_norm = x / W                               # scalar float ∈ [0,1] — where in image horizontally
-        y_norm = y / H                               # scalar float ∈ [0,1] — where in image vertically
-
-        # ── Feature 3-4: vessel direction θ as (cos θ, sin θ) ─────────────
-        # Stored as cos/sin pair — avoids discontinuity at ±π that raw angle has.
-        # Anisotropic: allows ChebConv to distinguish vessel direction at bifurcations.
-        angles = []                                  # list of float — one angle per connected edge
-        for nb in graph.neighbors(n):
-            pts = graph[n][nb]['pts']                # (L, 2) int — pixel path along this edge
-            if len(pts) >= 2:
-                dy = float(pts[-1][0] - pts[0][0])  # scalar float — row displacement
-                dx = float(pts[-1][1] - pts[0][1])  # scalar float — col displacement
-                angles.append(np.arctan2(dy, dx))   # scalar float ∈ [-π, π]
-        theta = float(np.mean(angles)) if angles else 0.0  # scalar float — mean orientation; 0 if isolated
+        # ── Feature 1-2: vessel direction θ as (cos θ, sin θ) ───────────────
+        # pts = ordered interior pixel path of edge n──nb; pts[0] sits next to n, pts[-1] next to nb.
+        # The direction of that edge, seen from n, is the vector pts[0] → pts[-1].
+        #
+        #   col →  0    1    2    3    4    5    6
+        #   row r  n   [p0]  p1   p2   p3  [p4]  nb        ← horizontal vessel
+        #                ↑                   ↑
+        #              pts[0]             pts[-1]
+        #           pixel(r,1)         pixel(r,5)
+        #
+        #   each pts entry is [row, col]:
+        #     pts[0]  = [r, 1]   →  pts[0][0]  = r  (row),  pts[0][1]  = 1  (col)
+        #     pts[-1] = [r, 5]   →  pts[-1][0] = r  (row),  pts[-1][1] = 5  (col)
+        #
+        #   dy = pts[-1][0] − pts[0][0] = r − r = 0    (same row  → no vertical displacement)
+        #   dx = pts[-1][1] − pts[0][1] = 5 − 1 = +4   (col 1→5  → 4 steps rightward)
+        #   θ  = arctan2(dy=0, dx=+4) = 0.0   →  pointing right →
+        #
+        #   Diagonal vessel (45°, down-right), 3 interior pts:
+        #
+        #   col →  0    1    2    3    4
+        #   row r  n   [p0]                    ← pts[0]  at pixel (r,   1)
+        #   r+1          p1
+        #   r+2               [p2]  nb         ← pts[-1] at pixel (r+2, 3);  nb at (r+3, 4)
+        #
+        #   dy = pts[-1][0] − pts[0][0] = (r+2) − r = +2  (moved 2 rows downward)
+        #   dx = pts[-1][1] − pts[0][1] =   3   − 1 = +2  (moved 2 cols rightward)
+        #   θ  = arctan2(dy=+2, dx=+2) = π/4  →  pointing down-right ↘
+        #
+        #   arctan2(dy, dx) — angle of displacement vector from positive x-axis →.
+        #   Uses sign of BOTH dy and dx to pick the correct quadrant (all 8 directions):
+        #
+        #          dy=−4 dx=0   up ↑  θ=−π/2
+        #          dy=−2 dx=+2  ↗    θ=−π/4
+        #                          │
+        #   dy=0 dx=−4  ← ─────────┼───────── → dy=0 dx=+4   θ=0  /  θ=±π
+        #                          │
+        #          dy=+2 dx=+2  ↘    θ=+π/4
+        #          dy=+4 dx=0  down ↓  θ=+π/2
+        #
+        #   Unlike plain arctan(dy/dx): arctan(1)=π/4 for BOTH (dy=+2,dx=+2) ↘ and
+        #   (dy=−2,dx=−2) ↖ since (+2)/(+2)=(−2)/(−2)=1.  arctan2 sees the signs
+        #   separately: arctan2(+2,+2)=+π/4 (↘) vs arctan2(−2,−2)=−3π/4 (↖).
+        #
+        #   Angle → (cos θ, sin θ) table:
+        #
+        #     direction      dy    dx    θ (rad)   cos θ    sin θ
+        #     →  right        0    +4     0.00     +1.00     0.00
+        #     ↓  down        +4     0    +π/2       0.00    +1.00
+        #     ←  left         0    −4    ±π        −1.00     0.00
+        #     ↑  up          −4     0    −π/2       0.00    −1.00
+        #     ↘  down-right  +2    +2    +π/4      +0.71    +0.71
+        #
+        #   Why (cos θ, sin θ) and not raw θ — concrete failure example:
+        #
+        #   Junction J with two edges both pointing roughly left (one slightly up, one slightly down):
+        #
+        #     nb_up ·····
+        #               \    dy=−1, dx=−4  →  θ = arctan2(−1,−4) ≈ −2.90 rad
+        #                J
+        #               /    dy=+1, dx=−4  →  θ = arctan2(+1,−4) ≈ +2.90 rad
+        #     nb_dn ·····
+        #
+        #   Raw θ average:   (−2.90 + 2.90) / 2 = 0.0 rad  →  "pointing right" →   WRONG ✗
+        #     The two angles straddle the ±π boundary and cancel to zero.
+        #
+        #   (cos θ, sin θ) average:
+        #     edge J──nb_up:  (cos(−2.90), sin(−2.90)) ≈ (−0.97, −0.24)
+        #     edge J──nb_dn:  (cos(+2.90), sin(+2.90)) ≈ (−0.97, +0.24)
+        #     mean:                                        (−0.97,  0.00)
+        #     → arctan2(0.00, −0.97) ≈ ±π  →  "pointing left"  ←   CORRECT ✓
+        #
+        #   Storing as a 2-D unit vector (cos θ, sin θ) also lets ChebConv weight
+        #   the horizontal (cos) and vertical (sin) components independently, giving
+        #   it the power to learn orientation-sensitive vessel filters.
+        cos_vals = []        # accumulates cos(θ) per edge leaving n; len = degree(n) after loop
+        sin_vals = []        #   e.g. tip (deg=1) → len=1; junction (deg=3) → len=3
+        for nb in graph.neighbors(n):               # nb = sknw node ID of each direct neighbour
+            pts = graph[n][nb]['pts']               # (L, 2) int — ordered [row,col] path of interior
+                                                    #   pixels between n and nb; does NOT include n or nb
+                                                    #   e.g. horizontal edge, L=5:
+                                                    #   pts = [[r,1],[r,2],[r,3],[r,4],[r,5]]
+            if len(pts) >= 2:           # need ≥2 distinct pixels to form a direction vector pts[-1]−pts[0];
+                                        #   L=0 → index error;  L=1 → pts[-1] is pts[0] → dy=dx=0 → arctan2(0,0)=0 (undefined direction)
+                dy    = float(pts[-1][0] - pts[0][0])  # scalar float — row displacement (+ = downward)
+                dx    = float(pts[-1][1] - pts[0][1])  # scalar float — col displacement (+ = rightward)
+                angle = np.arctan2(dy, dx)             # scalar float ∈ [−π, π]
+                cos_vals.append(np.cos(angle))         # circular mean: accumulate unit-vector components
+                sin_vals.append(np.sin(angle))         #   avoids ±π wrap-around of plain angle mean
+        # cos_vals / sin_vals after loop examples:
+        #   tip  (deg=1, down-right ↘):    cos_vals=[+0.71], sin_vals=[+0.71]
+        #   junction (deg=3, right/up/dn): cos_vals=[+1.00, 0.00, 0.00], sin_vals=[0.00, −1.00, +1.00]
+        cos_theta = float(np.mean(cos_vals)) if cos_vals else 1.0   # scalar float ∈ [−1,1]
+        sin_theta = float(np.mean(sin_vals)) if sin_vals else 0.0   # scalar float ∈ [−1,1]
+        #   tip  example:      cos_theta=+0.71, sin_theta=+0.71  (down-right ↘)
+        #   junction example:  cos_theta=+0.33, sin_theta= 0.00  (right →; up/dn sin values cancel)
+        #   isolated node:     cos_theta= 1.00, sin_theta= 0.00  (default; no edges → no direction)
 
         # ── Feature 5: diameter ────────────────────────────────────────────
         # dist[y,x] = radius (distance to nearest background pixel).
         # Multiply by 2 = diameter. Normalize by max image dimension.
         # Key failure fix: sudden diameter changes along a vessel → false positive or break.
-        d_norm = float(dist[y, x]) * 2 / max(H, W)  # scalar float ∈ [0,1]
+        d_norm = float(dist[y, x]) * 2 / max(H, W)
+        # scalar float ∈ [0,1] — normalized vessel diameter at this node's skeleton pixel
+        #   dist[y,x] = radius = how many pixels the skeleton lies from the nearest background pixel
+        #   "N-px-wide" = the vessel cross-section spans N True pixels in the mask
+        #   skeleton sits at the center → dist ≈ N/2 (background is ~N/2 steps away)
+        #   e.g. 3-px-wide vessel  (as in the dist example above): dist[y,x]=2.0 → d_norm = 2.0×2/1024 ≈ 0.004
+        #        20-px-wide vessel on a 1024×1024 tile:            dist[y,x]=10.0 → d_norm = 10.0×2/1024 ≈ 0.020
 
         # ── Feature 6: curvature κ ─────────────────────────────────────────
-        # Cross product of start/end tangent vectors of each edge at this node.
-        # |cross / (|v1|·|v2|)| = |sin(bend angle)| ≈ curvature.
+        # κ = (sum of |sin(bend angle)| over all edges) / degree  ∈ [0, 1]
+        #   each edge contributes |sin| ∈ [0,1]; dividing by degree normalizes to per-edge rate
+        #   measures how sharply the vessel bends at this node, independent of branch count
+        #   computed per edge as: |cross(v1,v2)| / (|v1|·|v2|) = |sin(θ)|
+        #     v1 = tangent at START of edge: pts[1]−pts[0]   (first-step direction)
+        #     v2 = tangent at END   of edge: pts[-1]−pts[-2] (last-step direction)
+        #     θ  = bend angle between v1 and v2
+        #
+        #   Why sine: the 2D cross product gives |v1|·|v2|·|sin(θ)| directly,
+        #   so dividing by |v1|·|v2| isolates |sin(θ)| without any arcsin call.
+        #     sin(0°)  = 0  →  v1 ∥ v2  →  straight  →  κ += 0
+        #     sin(90°) = 1  →  v1 ⊥ v2  →  right-angle bend  →  κ += 1  (max per edge)
+        #   Result ∈ [0,1] per edge regardless of step size.
+        #
+        #   Straight edge, L=5, pts = [[r,c+1],[r,c+2],[r,c+3],[r,c+4],[r,c+5]]:
+        #
+        #   col →  c  c+1  c+2  c+3  c+4  c+5  c+6
+        #   row r  n  [p0]  p1   p2   p3  [p4]  nb      all on same row
+        #
+        #      v1 = pts[1]−pts[0]   = [r,c+2]−[r,c+1] = [0,+1]  (rightward)
+        #      v2 = pts[-1]−pts[-2] = [r,c+5]−[r,c+4] = [0,+1]  (rightward)
+        #      cross = 0×1 − 1×0 = 0   →  κ += 0
+        #
+        #   90° bend, L=4, pts = [[r,c+1],[r,c+2],[r+1,c+2],[r+2,c+2]]:
+        #
+        #   col →  c  c+1  c+2  c+3
+        #   row r  n  [p0]  p1             v1 = [r,c+2]−[r,c+1]     = [0,+1]  (rightward →)
+        #   r+1          p2
+        #   r+2         [p3]  nb           v2 = [r+2,c+2]−[r+1,c+2] = [+1,0]  (downward ↓)
+        #
+        #      cross = v1[0]×v2[1] − v1[1]×v2[0] = 0×0 − 1×1 = −1
+        #      norm  = |[0,+1]| × |[+1,0]| = 1 × 1 = 1
+        #      κ += |−1/1| = 1.0   (|sin(90°)| = 1)
+        #
+        #   Junction node (deg=3): accumulate over 3 edges, then divide by 3
+        #     edge 1 (straight, v1=[0,+1], v2=[0,+1]):     κ += 0.00
+        #     edge 2 (45° bend, v1=[0,+1], v2=[+1,+1]):    cross=−1, norm=√2  →  κ += 0.71
+        #     edge 3 (90° bend, v1=[0,+1], v2=[+1, 0]):    cross=−1, norm=1   →  κ += 1.00
+        #     sum=1.71 → kappa = 1.71/3 = 0.57   ← normalized; straight node≈0, tight elbow≈1
+        #
         # High κ = sharp bend. Low κ = straight vessel.
         kappa = 0.0                                  # scalar float — accumulated bend across all edges
         for nb in graph.neighbors(n):
@@ -327,6 +456,7 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
                 cross = float(v1[0]*v2[1] - v1[1]*v2[0])          # scalar — z-component of 2D cross product
                 norm  = float(np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-8
                 kappa += abs(cross / norm)           # accumulate |sin(angle)| per edge
+        kappa = kappa / max(graph.degree(n), 1)      # mean |sin| per edge ∈ [0,1] — divide by degree so value is comparable across tips and junctions
 
         # ── Feature 7: degree ──────────────────────────────────────────────
         # Number of vessel branches at this node.
@@ -342,61 +472,56 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         # Real vessel: part of a large network → high component_size.
         # False positive blob: isolated small component → low component_size.
         # This is the primary feature for detecting spurious isolated blobs.
-        ci        = node_to_comp[n]                  # scalar int — component index
-        comp_norm = float(comp_sizes[ci]) / float(max_comp_size)  # scalar float ∈ [0,1]
+        ci        = node_to_comp[n]                  # n = current sknw node ID; ci = index of the component n belongs to; e.g. n=3 → ci=1
+        comp_norm = float(comp_sizes[ci]) / float(max_comp_size)  # comp_sizes[ci] = node count of ci's component; max_comp_size = largest count; e.g. 1/3 ≈ 0.33
 
-        # ── Feature 9: endpoint_distance ──────────────────────────────────
-        # Distance from this node to the nearest vessel endpoint (degree-1 node).
-        # Nodes near an endpoint are at positions where vessels commonly break.
-        # The GAT uses this to identify break-prone regions for reconnection.
-        if endpoint_pos is not None and len(endpoint_pos) > 0:
-            node_yx   = np.array([y, x], dtype=np.float32)         # (2,) float32 — current node position
-            dists_to_eps = np.linalg.norm(endpoint_pos - node_yx, axis=1)  # (n_endpoints,) — Euclidean dist to each endpoint
-            ep_dist   = float(dists_to_eps.min()) / max(H, W)      # scalar float ∈ [0,1] — normalized nearest endpoint dist
-        else:
-            ep_dist = 1.0                            # no endpoints in graph → far from any endpoint
-
-        # ── Feature 10: diameter_consistency ──────────────────────────────
+        # ── Feature 9: diameter_consistency ───────────────────────────────
         # Standard deviation of vessel diameter sampled along all edges at this node.
         # Consistent diameter along a segment → real vessel (low std).
         # Sudden diameter change → false positive joining two different structures (high std).
-        diameters_along_edges = []
+        diameters_along_edges = []          # collects dist values (= radii) from every interior pixel of every edge at n
         for nb in graph.neighbors(n):
-            pts = graph[n][nb]['pts']                # (L, 2) int — pixel path
+            pts = graph[n][nb]['pts']        # (L, 2) int — interior pixel path of edge n──nb; does NOT include n or nb
             if len(pts) > 0:
-                ys_e = np.clip(pts[:, 0].astype(int), 0, H-1)   # (L,) int
-                xs_e = np.clip(pts[:, 1].astype(int), 0, W-1)   # (L,) int
-                diameters_along_edges.extend(dist[ys_e, xs_e].tolist())  # list of floats — radius at each path pixel
-        diam_std = float(np.std(diameters_along_edges)) / max(H, W) if diameters_along_edges else 0.0
-        # scalar float — low = consistent width (good vessel), high = variable width (suspicious)
+                ys_e = np.clip(pts[:, 0].astype(int), 0, H-1)   # (L,) int — row coords of path pixels, clamped to image bounds
+                xs_e = np.clip(pts[:, 1].astype(int), 0, W-1)   # (L,) int — col coords of path pixels, clamped to image bounds
+                diameters_along_edges.extend(dist[ys_e, xs_e].tolist())
+                # dist[ys_e, xs_e]: (L,) float — radius at each path pixel (Euclidean dist to nearest background)
+                # extend appends all L radii into the flat list; after the loop it holds radii from ALL edges at n
+        if diameters_along_edges:
+            r     = np.array(diameters_along_edges)
+            diam_std = float(r.std() / (r.mean() + 1e-8))   # coefficient of variation: std / mean ∈ [0, ~1]
+            # scale-free: measures relative width variability regardless of absolute vessel size
+            #   consistent vessel (radii ≈ [1.0, 1.1, 0.9]):  std≈0.1, mean≈1.0 → CoV≈0.10  (low → real vessel)
+            #   sudden change     (radii ≈ [1, 1, 5, 9, 10]): std≈4.0, mean≈5.2 → CoV≈0.77  (high → suspicious)
+        else:
+            diam_std = 0.0
 
-        # ── Feature 11-42: CNN features ────────────────────────────────────
+        # ── Feature 10-41: CNN features ────────────────────────────────────
         # 32-dim appearance vector from the CNN decoder at this node's pixel position.
         # Provides local texture, intensity, and learned vessel context.
         cnn_feat = pixel_feats_np[y, x]             # (32,) float32 — sampled from (H, W, 32) feature map
 
-        # ── Assemble 42-dim node feature vector ────────────────────────────
+        # ── Assemble 39-dim node feature vector ────────────────────────────
         node_pos.append([x, y])                     # list grows to (N, 2)
         node_feats.append(np.concatenate([
-            [x_norm,                # [0]  position x          ∈ [0,1]
-             y_norm,                # [1]  position y          ∈ [0,1]
-             np.cos(theta),         # [2]  direction cos       ∈ [-1,1]
-             np.sin(theta),         # [3]  direction sin       ∈ [-1,1]
-             d_norm,                # [4]  diameter            ∈ [0,1]   fixes broken thin vessels
-             kappa,                 # [5]  curvature           ∈ [0,∞]  fixes bifurcation errors
-             deg_norm,              # [6]  degree              ∈ [0,~1]  detects endpoints/blobs
-             comp_norm,             # [7]  component_size      ∈ [0,1]   isolates false blobs
-             ep_dist,               # [8]  endpoint_distance   ∈ [0,1]   locates break positions
-             diam_std],             # [9]  diameter_std        ∈ [0,1]   flags width changes
-            cnn_feat                # [10-41] CNN features     (32,)     local appearance
-        ]))                         # (42,) float32 — NODE_FEAT_DIM
+            [cos_theta,             # [0]  direction cos       ∈ [-1,1]
+             sin_theta,             # [1]  direction sin       ∈ [-1,1]
+             d_norm,                # [2]  diameter            ∈ [0,1]   fixes broken thin vessels
+             kappa,                 # [3]  curvature           ∈ [0,1]  fixes bifurcation errors
+             deg_norm,              # [4]  degree              ∈ [0,~1]  detects endpoints/blobs
+             comp_norm,             # [5]  component_size      ∈ [0,1]   isolates false blobs
+             diam_std],             # [6]  diameter_std        ∈ [0,1]   flags width changes
+            cnn_feat                # [7-38] CNN features      (32,)     local appearance
+        ]))                         # (39,) float32 — NODE_FEAT_DIM
 
     # ── Build edge features ────────────────────────────────────────────────
-    node_idx            = {n: i for i, n in enumerate(nodes)}   # dict: networkx node ID → integer index 0..N-1
+    node_idx            = {n: i for i, n in enumerate(nodes)}    # dict: networkx node ID → integer index 0..N-1
     edge_src, edge_dst  = [], []                                 # will become (E,) each
     edge_feats_list     = []                                     # will become (E, EDGE_FEAT_DIM)
 
     for u, v, data in graph.edges(data=True):
+        # u, v: sknw node IDs of the two endpoints; data: edge attribute dict with key 'pts'
         if u not in node_idx or v not in node_idx:
             continue
         i, j = node_idx[u], node_idx[v]             # scalar ints — integer indices
@@ -407,16 +532,15 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         # ── Edge feature 1: normalized length ─────────────────────────────
         length_norm = length / max(H, W)             # scalar float ∈ [0,1]
 
-        # ── Edge feature 2: gap_intensity_mean ────────────────────────────
+        # ── Edge feature 2-3: gap_intensity_mean, gap_intensity_std ────────────────────────────
         # Mean image brightness along the vessel path.
         # High mean → fluorescence signal present → real vessel.
         # Low mean  → dark region between two predicted segments → likely a false prediction.
         if len(pts) > 0:
             ys_e = np.clip(pts[:, 0].astype(int), 0, H-1)   # (L,) int — row coords
             xs_e = np.clip(pts[:, 1].astype(int), 0, W-1)   # (L,) int — col coords
-            intensities  = img_np[ys_e, xs_e]               # (L,) float32 — pixel intensities along path
+            intensities  = img_np[ys_e, xs_e]               # (L,) float32 — pixel intensities along path         img_np: (H, W) - float32 raw image for graph intensity features
             gap_mean     = float(intensities.mean())         # scalar float ∈ [0,1]
-            # ── Edge feature 3: gap_intensity_std ─────────────────────────
             # Standard deviation of brightness along the path.
             # Low std  → uniform signal → continuous vessel.
             # High std → patchy signal → broken or uncertain vessel segment.
@@ -426,16 +550,82 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
             gap_std  = 0.0
 
         # ── Edge feature 4: delta_theta ────────────────────────────────────
-        # Angular difference between the orientations of the two endpoint nodes.
-        # Low Δθ  → both nodes point in the same direction → straight consistent vessel.
-        # High Δθ → nodes point in different directions → sharp bend or false branch at bifurcation.
-        fi          = node_feats[i]                          # (42,) float32 — source node features
-        fj          = node_feats[j]                          # (42,) float32 — destination node features
-        ti          = np.arctan2(fi[3], fi[2])               # scalar float — recover θ_i from (sin=index3, cos=index2)
-        tj          = np.arctan2(fj[3], fj[2])               # scalar float — recover θ_j
-        delta_theta = float(abs(ti - tj))                    # scalar float ∈ [0, 2π]
+        # Angular difference between the mean orientations of the two endpoint nodes.
+        # Each node's orientation = mean(cos,sin) over ALL its edges, not just this one.
+        # Low Δθ  → both nodes face the same direction → straight consistent vessel.
+        # High Δθ → nodes face different directions → false connection between two structures.
+        #
+        #   i, j: compact integer indices into node_feats (0..N-1), derived from node_idx[u] and node_idx[v]
+        #         node_idx maps sknw node ID → row position in node_feats
+        #         i = node_idx[u] → row of source node u's 39-dim feature vector in node_feats
+        #         j = node_idx[v] → row of destination node v's 39-dim feature vector in node_feats
+        #   Stored in node_feats (set in the node-feature loop above):
+        #     node_feats[i][0] = cos θ_i,   node_feats[i][1] = sin θ_i
+        #     node_feats[j][0] = cos θ_j,   node_feats[j][1] = sin θ_j
+        #
+        #   Recovery — invert (cos, sin) back to θ using arctan2:
+        #     θ = arctan2(sin θ, cos θ)   ∈ [−π, π]
+        #     arctan2(y, x) = angle of vector (x, y) from the positive x-axis
+        #       e.g. arctan2(sin=0, cos=+1) = 0        (→ rightward)
+        #            arctan2(sin=+1, cos=0) = π/2       (↓ downward)
+        #            arctan2(sin=0,  cos=−1) = ±π       (← leftward)
+        #
+        #   θ_i = arctan2(node_feats[i][1], node_feats[i][0])  =  arctan2(sin θ_i, cos θ_i)
+        #   θ_j = arctan2(node_feats[j][1], node_feats[j][0])  =  arctan2(sin θ_j, cos θ_j)
+        #   Both are the mean orientation of that node across ALL its edges (not just this edge).
+        #
+        #   Case 1 — real straight vessel, tip i to tip j (Δθ = 0):
+        #
+        #   col →  0    1    2    3    4    5    6
+        #   row r  i    p    p    p    p    p    j        pts ordered left→right
+        #
+        #     θ_i = arctan2(0, +4) = 0   (1 edge, pts[0]=col1→pts[-1]=col5, dx=+4)
+        #     θ_j = arctan2(0, +4) = 0   (sknw stores pts in one fixed order; graph[j][i]['pts']
+        #                                  returns the same array as graph[i][j]['pts'], so j also
+        #                                  sees pts[0]=col1→pts[-1]=col5, dx=+4 → also →)
+        #     Δθ = |0 − 0| = 0.0   → consistent direction → real vessel ✓
+        #
+        #   Case 2 — false connection between two perpendicular structures (Δθ = π/2):
+        #
+        #   col →  0    1    2    3
+        #   row r  T    p    p   J_A          ← J_A: tip of horizontal vessel
+        #                        |            ← false edge: directly adjacent, 0 interior pts
+        #   r+1                 J_B          ← J_B: tip of vertical vessel
+        #   r+2                  p
+        #   r+3                  p
+        #   r+4                  T
+        #
+        #     J_A: tip with 1 real (horizontal) edge; false edge is direct → 0 pts → skipped
+        #       real edge pts: [[r,1],[r,2]] → dx = 2−1 = +1, dy = 0 → angle = 0
+        #       cos_vals=[+1], sin_vals=[0]  →  θ_J_A = arctan2(0, +1) = 0   (→ rightward)
+        #
+        #     J_B: tip with 1 real (vertical) edge; false edge is direct → 0 pts → skipped
+        #       real edge pts: [[r+2,3],[r+3,3]] → dy = +1, dx = 0 → angle = π/2
+        #       cos_vals=[0], sin_vals=[+1]  →  θ_J_B = arctan2(+1, 0) = π/2  (↓ downward)
+        #
+        #     Δθ = |0 − π/2| = 1.57   → direction mismatch → false connection ✗
+        #       Why: a real vessel segment joins two nodes that face the SAME direction (both
+        #       aligned along the vessel axis). J_A faces horizontally; J_B faces vertically.
+        #       They belong to two different structural elements — the edge between them is a
+        #       phantom bridge predicted across a gap, not a real continuous vessel.
+        fi          = node_feats[i]                          # (39,) float32 — source node features
+        fj          = node_feats[j]                          # (39,) float32 — destination node features
+        ti          = np.arctan2(fi[1], fi[0])               # scalar float — recover θ_i from (sin=index1, cos=index0)
+        tj          = np.arctan2(fj[1], fj[0])               # scalar float — recover θ_j
+        delta_theta = float(abs(ti - tj))
+        # abs(): sign is discarded because the feature measures direction disagreement,
+        # which is symmetric — whether i is +30° or −30° relative to j, the mismatch is 30°.
+        # Range is [0, 2π] rather than [0, π] because plain subtraction does not wrap: two
+        # "leftward" nodes at ti≈+π and tj≈−π give |ti−tj|≈2π despite matching directions.
+        # ChebConv learns to treat both near-0 and near-2π as "consistent"; values near π
+        # are the true mismatches (perpendicular structures).
 
-        # Add edge in both directions (undirected graph)
+        # sknw gives one undirected edge per vessel segment (u──v), but ChebConv does message
+        # passing along directed edges: node u reads messages arriving from its neighbours, so
+        # it needs an explicit u←v entry, not just u→v.  Storing both (i→j) and (j→i) lets
+        # every node receive topology signals from both ends of every connected segment.
+        # The feature vector is identical for both directions: length, intensity, and delta_theta
+        # all describe the segment itself, not which end you're standing on.
         for src, dst in [(i, j), (j, i)]:
             edge_src.append(src)
             edge_dst.append(dst)
@@ -451,7 +641,7 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
 
     return {
         'node_pos':   np.array(node_pos,        dtype=np.float32),   # (N, 2)
-        'node_feats': np.array(node_feats,      dtype=np.float32),   # (N, 42)
+        'node_feats': np.array(node_feats,      dtype=np.float32),   # (N, 39)
         'edge_index': np.array([edge_src, edge_dst], dtype=np.int64),# (2, E)
         'edge_feats': np.array(edge_feats_list, dtype=np.float32),   # (E, 4)
     }
@@ -462,7 +652,7 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
 class VesselGraphNet(nn.Module):
     """
     3-layer ChebConv with K=10 polynomial hops.
-    Input:  node_feats (N, NODE_FEAT_DIM=42)  anisotropic + topological features
+    Input:  node_feats (N, NODE_FEAT_DIM=39)  anisotropic + topological features
     Output: node_emb   (N, 64)               enriched embeddings encoding vessel topology
 
     K=10: each node aggregates information from up to 10 hops away per layer.
@@ -470,7 +660,7 @@ class VesselGraphNet(nn.Module):
     """
     def __init__(self, in_ch=NODE_FEAT_DIM, hidden=64, out_ch=64, K=10):
         super().__init__()
-        self.conv1 = ChebConv(in_ch,  hidden, K=K)   # (N, 42) → (N, 64): aggregates 10-hop neighbourhood
+        self.conv1 = ChebConv(in_ch,  hidden, K=K)   # (N, 39) → (N, 64): aggregates 10-hop neighbourhood
         self.conv2 = ChebConv(hidden, hidden, K=K)   # (N, 64) → (N, 64): deeper topology context
         self.conv3 = ChebConv(hidden, out_ch, K=K)   # (N, 64) → (N, 64): final topology embedding
         self.bn1   = nn.BatchNorm1d(hidden)           # normalizes 64 features across N nodes → (N, 64)
@@ -478,11 +668,11 @@ class VesselGraphNet(nn.Module):
 
     def forward(self, x, edge_index):
         """
-        x:          (N, 42)  node feature matrix
+        x:          (N, 39)  node feature matrix
         edge_index: (2, E)   COO-format edge list
         Returns:    (N, 64)  enriched node embeddings
         """
-        x = F.relu(self.bn1(self.conv1(x, edge_index)))   # (N,42)→conv1→(N,64)→bn1→relu→(N,64)
+        x = F.relu(self.bn1(self.conv1(x, edge_index)))   # (N,39)→conv1→(N,64)→bn1→relu→(N,64)
         x = F.relu(self.bn2(self.conv2(x, edge_index)))   # (N,64)→conv2→(N,64)→bn2→relu→(N,64)
         x = self.conv3(x, edge_index)                     # (N,64)→conv3→(N,64) — no activation before scatter
         return x                                           # (N, 64)
@@ -548,12 +738,12 @@ class VesselSegNet(nn.Module):
             │                                      │
         CNN upsampling                       Graph path
         feats[0] → ConvT×2                   coarse mask → skeletonize → sknw
-        (B,256,H/4,W/4)→(B,32,H,W)          build 42-dim node features:
+        (B,256,H/4,W/4)→(B,32,H,W)          build 41-dim node features:
         F_pixel                                position, direction, diameter,
                                                curvature, degree, component_size,
                                                endpoint_distance, diameter_std, CNN(32)
                                              ChebConv(K=10) × 3 layers
-                                             (N,42)→(N,64)
+                                             (N,39)→(N,64)
                                              scatter+Gaussian → (B,64,H,W)
                                              F_graph
             │                                      │
@@ -570,7 +760,7 @@ class VesselSegNet(nn.Module):
         super().__init__()
         self.encoder   = SAM2Encoder()                                          # frozen Hiera ViT-L
         self.cnn_dec   = CNNDecoder(in_ch=256)                                  # (B,256,H/4,W/4)→(B,32,H,W)
-        self.graph_net = VesselGraphNet(in_ch=NODE_FEAT_DIM, hidden=64,         # (N,42)→(N,64)
+        self.graph_net = VesselGraphNet(in_ch=NODE_FEAT_DIM, hidden=64,         # (N,39)→(N,64)
                                         out_ch=64, K=10)
         self.fuse_proj = nn.Conv2d(32 + 64, 32, kernel_size=1)                 # (B,96,H,W)→(B,32,H,W)
         self.head      = nn.Conv2d(32, 1, kernel_size=1)                        # (B,32,H,W)→(B,1,H,W)
@@ -601,15 +791,15 @@ class VesselSegNet(nn.Module):
                 # (B,32,H,W)[0] → (32,H,W) → permute → (H,W,32) float32 numpy
 
                 graph_data = build_vessel_graph(mask_coarse_np, img_np, pf_np)
-                # dict with node_pos(N,2), node_feats(N,42), edge_index(2,E), edge_feats(E,4)
+                # dict with node_pos(N,2), node_feats(N,39), edge_index(2,E), edge_feats(E,4)
                 # or None if graph is degenerate
 
                 if graph_data is not None:
-                    nf  = torch.from_numpy(graph_data['node_feats']).to(x.device)  # (N, 42) float32
+                    nf  = torch.from_numpy(graph_data['node_feats']).to(x.device)  # (N, 39) float32
                     ei  = torch.from_numpy(graph_data['edge_index']).to(x.device)  # (2, E)  int64
                     np_ = torch.from_numpy(graph_data['node_pos']).to(x.device)    # (N, 2)  float32
 
-                    node_emb = self.graph_net(nf, ei)                  # (N, 42) → (N, 64) topology embeddings
+                    node_emb = self.graph_net(nf, ei)                  # (N, 41) → (N, 64) topology embeddings
                     F_graph  = scatter_to_pixels(np_, node_emb, H, W, x.device)   # (1, 64, H, W)
                     F_graph  = F_graph.expand(B, -1, -1, -1)           # (B, 64, H, W) — broadcast to batch
 
