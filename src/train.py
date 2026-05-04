@@ -80,7 +80,12 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True):
 
 def main(args):
     set_seed(SEED)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # MPS = Apple Silicon GPU (Metal); falls back to CPU on Intel Macs.
+    device = torch.device(
+        'cuda' if torch.cuda.is_available()
+        else 'mps' if torch.backends.mps.is_available()
+        else 'cpu'
+    )
     print(f'Device: {device}')
 
     # Load all annotated pairs

@@ -1,0 +1,31 @@
+
+═══ Fold 1/5 ═══
+  Train tiles: 480  |  Val tiles: 120
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] You are using a model of type `sam2_video` to instantiate a model of type `sam2`. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Loading weights: 100%|██████████| 741/741 [00:00<00:00, 6318.55it/s]
+SAM2 encoder  frozen:    212,703,280
+SAM2 decoder  trainable: 4,221,585
+  0%|          | 0/240 [02:19<?, ?it/s]
+Traceback (most recent call last):
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/train.py", line 276, in <module>
+    main(args)
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/train.py", line 179, in main
+    tr_loss, tr_parts = run_epoch(model, train_loader, criterion,
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/train.py", line 55, in run_epoch
+    loss, loss_dict = criterion(logits, msk, hann)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bashit.a/miniforge3/envs/pytorch_env/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bashit.a/miniforge3/envs/pytorch_env/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/loss.py", line 150, in forward
+    l_dice  = dice_loss(pred,   target, hann_weight)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/loss.py", line 23, in dice_loss
+    pred   = pred * w    # (B, H*W)
+             ~~~~~^~~
+RuntimeError: The size of tensor a (1048576) must match the size of tensor b (1331200) at non-singleton dimension 1

@@ -211,10 +211,16 @@ def _augment(img, msk, rng=None):
         msk = np.flipud(msk).copy()
 
     # Random 90° rotation (k ∈ {1, 2, 3})
+    # k=1 or k=3 swaps H and W (e.g. 1300×1024 → 1024×1300), which mismatches the
+    # pre-computed Hanning weight map; resize back to the original (h, w) to keep
+    # all tensors the same shape while still benefiting from rotational augmentation.
     k = rng.integers(0, 4)
     if k > 0:
         img = np.rot90(img, k).copy()
         msk = np.rot90(msk, k).copy()
+        if img.shape[:2] != (h, w):
+            img = resize(img, (h, w), preserve_range=True, anti_aliasing=True).astype(np.uint8)
+            msk = resize(msk, (h, w), order=0, preserve_range=True, anti_aliasing=False).astype(msk.dtype)
 
     # Random zoom-in: crop a random sub-region then resize back to original shape.
     # order=0 for mask preserves binary labels without interpolation artifacts.

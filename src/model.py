@@ -92,7 +92,13 @@ class SAM2Encoder(nn.Module):
         with torch.no_grad():            # frozen — no gradients, saves memory and compute
             vision_out = self.sam2.vision_encoder(**inputs)
 
-        return vision_out.feature_maps   # list of 4 tensors: [(B,256,H/4,W/4), ..., (B,256,H/32,W/32)]
+        # feature_maps was renamed to fpn_hidden_states in transformers ≥4.47 (same structure in 4.x and 5.x).
+        # SAM2 processor rescales every input to 1024×1024, so for any tile size:
+        #   fpn_hidden_states[0]: (B, 256, 256, 256)  — stride 4  (1024/4),  finest scale
+        #   fpn_hidden_states[1]: (B, 256, 128, 128)  — stride 8  (1024/8)
+        #   fpn_hidden_states[2]: (B, 256,  64,  64)  — stride 16 (1024/16), coarsest scale
+        # CNNDecoder only uses index [0] (finest), the coarser scales are available for future use.
+        return vision_out.fpn_hidden_states
 
 
 # ── CNN Upsampling Path ────────────────────────────────────────────────────────
@@ -117,10 +123,10 @@ class CNNDecoder(nn.Module):
         )
 
     def forward(self, feats):
-        """feats: list of 4 FPN feature maps; use finest scale feats[0]"""
-        x = self.up1(feats[0])   # (B, 256, H/4, W/4) → (B, 64, H/2, W/2)
-        x = self.up2(x)          # (B, 64, H/2, W/2)  → (B, 32, H, W)
-        return x                 # (B, 32, H, W) — pixel-aligned feature map F_pixel
+        """feats: tuple of 3 FPN feature maps from SAM2 (always 1024×1024 after processor rescale); use finest scale feats[0]"""
+        x = self.up1(feats[0])   # (B, 256, 256, 256) → (B, 64, 512, 512)  [SAM2 stride-4 feature, 4× upsample]
+        x = self.up2(x)          # (B, 64, 512, 512)  → (B, 32, 1024, 1024)
+        return x                 # (B, 32, 1024, 1024) — pixel-aligned at SAM2 resolution
 
 
 # ── Graph Construction ─────────────────────────────────────────────────────────
@@ -1000,5 +1006,12 @@ class VesselSegNet(nn.Module):
         else:
             F_fused = F_pixel           # no mask provided → CNN-only forward pass
 
-        logits = self.head(F_fused)     # (B, 32, H, W) → (B, 1, H, W) raw logits
+        logits = self.head(F_fused)     # (B, 32, 1024, 1024) → (B, 1, 1024, 1024) raw logits
+
+        # SAM2 processor internally rescales every tile to 1024×1024, so logits are always
+        # 1024×1024 regardless of the original tile size (TILE_H=1300, TILE_W=1024).
+        # Resize back to the original tile dimensions so logits align with the target mask.
+        if logits.shape[-2:] != (H, W):
+            logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+
         return logits                   # (B, 1, H, W) float32 — passed to VesselLoss or sigmoid

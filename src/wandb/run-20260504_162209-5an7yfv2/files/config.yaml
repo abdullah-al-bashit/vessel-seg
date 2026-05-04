@@ -1,0 +1,92 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            n2zuhw43x1837t3tlkeqwn1h8nlsbdyu:
+                apple:
+                    ecpuCores: 4
+                    gpuCores: 8
+                    macModel: MacBookPro17,1
+                    memoryGb: 16
+                    name: Apple M1
+                    pcpuCores: 4
+                    ramTotalBytes: "17179869184"
+                    swapTotalBytes: "21474836480"
+                args:
+                    - --input_dir
+                    - ../data/images
+                    - --output_dir
+                    - ../data/masks
+                    - --ckpt_dir
+                    - ../checkpoints
+                    - --epochs
+                    - "1"
+                    - --batch_size
+                    - "2"
+                    - --lr
+                    - "1e-4"
+                codePath: src/train.py
+                codePathLocal: train.py
+                cpu_count: 8
+                cpu_count_logical: 8
+                disk:
+                    /:
+                        total: "994662584320"
+                        used: "961006940160"
+                email: eeebashit@gmail.com
+                executable: /Users/bashit.a/miniforge3/envs/pytorch_env/bin/python
+                git:
+                    commit: 9d8b408e61f86619e46a8b9223d592d748d63712
+                    remote: git@github.com:abdullah-al-bashit/vessel-seg.git
+                host: FACC02F22KKQ05N.tld
+                memory:
+                    total: "17179869184"
+                os: macOS-13.7.8-arm64-arm-64bit
+                program: /Users/bashit.a/Downloads/vessel_seg_github/src/train.py
+                python: CPython 3.11.5
+                root: /Users/bashit.a/Downloads/vessel_seg_github/src
+                startedAt: "2026-05-04T20:22:09.628775Z"
+                writerId: n2zuhw43x1837t3tlkeqwn1h8nlsbdyu
+        m: []
+        python_version: 3.11.5
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 77
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 77
+            "3":
+                - 16
+            "4": 3.11.5
+            "5": 0.26.1
+            "6": 5.7.0
+            "12": 0.26.1
+            "13": darwin-arm64
+batch_size:
+    value: 2
+epochs:
+    value: 1
+lambda_cldice:
+    value: 0.5
+lr:
+    value: 0.0001
+n_folds:
+    value: 5
+patience:
+    value: 30
+seed:
+    value: 42
+test_split:
+    value: 0.2
