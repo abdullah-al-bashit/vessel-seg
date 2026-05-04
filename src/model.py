@@ -640,7 +640,7 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         return None             # no edges → cannot do message passing
 
     return {
-        'node_pos':   np.array(node_pos,        dtype=np.float32),   # (N, 2)
+        'node_pos':   np.array(node_pos,        dtype=np.float32),   # (N, 2) — each row is [x=col, y=row]
         'node_feats': np.array(node_feats,      dtype=np.float32),   # (N, 39)
         'edge_index': np.array([edge_src, edge_dst], dtype=np.int64),# (2, E)
         'edge_feats': np.array(edge_feats_list, dtype=np.float32),   # (E, 4)
@@ -685,11 +685,13 @@ def scatter_to_pixels(node_pos, node_emb, H, W, device, sigma=2.0):
     Scatter node embeddings (on 1-pixel skeleton) back to full H×W pixel grid.
     Gaussian spread fills vessel width so every pixel inside a vessel gets graph features.
 
-    node_pos: (N, 2)  (x, y) pixel coordinates of skeleton nodes
+    Operates on a single image (not a batch).  Output is (1, D, H, W).
+
+    node_pos: (N, 2)  [x=col, y=row] pixel coordinates of skeleton nodes
     node_emb: (N, D)  node embeddings from ChebConv
     Returns:  (1, D, H, W)  scattered + blurred feature map
     """
-    D      = node_emb.shape[1]                           # scalar int — embedding dim, e.g. 64
+    D      = node_emb.shape[1]                          # scalar int — embedding dim, e.g. 64
     F_scat = torch.zeros(1, D, H, W, device=device)     # (1, D, H, W) — blank canvas, all zeros
 
     xs = node_pos[:, 0].long().clamp(0, W-1)   # (N,) int64 — x (col) coords clamped to [0, W-1]
@@ -698,13 +700,103 @@ def scatter_to_pixels(node_pos, node_emb, H, W, device, sigma=2.0):
     # Place each node's D-dim embedding at its pixel position
     F_scat[0, :, ys, xs] = node_emb.T          # node_emb.T: (D, N) → writes to (1, D, H, W)
 
-    # Gaussian spread σ=2 — fills vessel width around 1-pixel skeleton nodes
+    # Gaussian spread σ=2 — fills vessel width around 1-pixel skeleton nodes.
     # Without this, only the exact skeleton pixels get graph features;
     # nearby vessel pixels would have zeros and see no topology information.
-    kernel_size = int(6 * sigma + 1) | 1        # odd number; e.g. σ=2 → ks=13
-    padding     = kernel_size // 2              # same-padding keeps H, W unchanged
+    #
+    # Kernel equation:  G(r,c) = exp(−(r²+c²) / (2σ²))
+    #   r = row offset from centre, c = col offset from centre.
+    #
+    #   Normalisation:  G_norm(r,c) = G(r,c) / ΣG
+    #     where ΣG = Σ_{r,c} G(r,c) summed over all ks×ks grid positions
+    #     ensures Σ G_norm = 1 — convolution preserves mean signal level.
+    #
+    #   e.g. σ=2, ks=13 (r,c ∈ {−6,…,+6}):
+    #     Unnormalised:  G(0,0)=exp(0)=1.000,  G(0,±1)=exp(−1/8)≈0.882,  G(0,±2)=exp(−4/8)≈0.607
+    #     ΣG ≈ 25.08  (sum of all 169 kernel entries)
+    #     Normalised:    G_norm(0,0)=1.000/25.08≈0.040,  G_norm(0,±1)≈0.035,  G_norm(0,±2)≈0.024
+    #
+    # Before blur — F_scat has point masses at ALL N skeleton node positions simultaneously
+    # (F_scat[0, :, ys, xs] = node_emb.T writes every node in one vectorised op):
+    #
+    #   col →   0     1     2     3     4
+    #   row 0  0.00  0.00  0.00  0.00  0.00
+    #   row 1  0.00  V_A   0.00  0.00  0.00   ← node A: embedding V_A at pixel (1,1)
+    #   row 2  0.00  0.00  0.00  0.00  0.00
+    #   row 3  0.00  0.00  0.00  V_B   0.00   ← node B: embedding V_B at pixel (3,3)
+    #   row 4  0.00  0.00  0.00  0.00  0.00
+    #
+    # After blur — each output pixel sums contributions from ALL nodes weighted by G
+    # (G = Gaussian kernel defined above: G(r,c) = exp(−(r²+c²)/(2σ²)), normalised to ΣG=1):
+    #
+    #   Variables:
+    #     r, c       — row and col index of the output pixel being evaluated (0..H-1, 0..W-1)
+    #     n          — index over all N skeleton nodes
+    #     V_n        — D-dim embedding vector of node n (output of ChebConv, shape (D,))
+    #     r_n, c_n   — row and col pixel position of node n in the skeleton (from node_pos)
+    #     Δr, Δc     — offset from output pixel to node: Δr = r_n − r,  Δc = c_n − c
+    #     G_norm(Δr,Δc) — normalised Gaussian weight at offset (Δr,Δc): how strongly
+    #                     node n contributes to pixel (r,c) based on their distance
+    #
+    #   Output formula (one value per pixel, per embedding channel):
+    #     output(r,c) = Σ_n  V_n × G_norm(r_n − r,  c_n − c)
+    #   For the two-node example above:
+    #     output(r,c) = V_A×G_norm(1−r, 1−c) + V_B×G_norm(3−r, 3−c)
+    #
+    #   Why this formula is correct — F.conv2d computes cross-correlation (kernel NOT flipped):
+    #     dr, dc     — kernel offset variables in the cross-correlation sum, ranging over ±(ks//2)
+    #     output(r,c) = Σ_{dr,dc} F_scat[r+dr, c+dc] × G_norm(dr, dc)
+    #   F_scat is zero everywhere except V_n at (r_n, c_n), so only one term per node survives:
+    #     r+dr = r_n  and  c+dc = c_n  →  dr = r_n−r,  dc = c_n−c
+    #     output(r,c) = V_n × G_norm(r_n − r,  c_n − c)
+    #   G is symmetric: G_norm(Δr,Δc) = G_norm(−Δr,−Δc); cross-correlation = convolution here.
+    #
+    #   Unnormalised values (σ=2): G(Δr,Δc) = exp(−(Δr²+Δc²)/8)
+    #     G(0, 0) = exp(0)    = 1.000
+    #     G(0,±1) = exp(−1/8) ≈ 0.882   G(±1, 0) = exp(−1/8) ≈ 0.882
+    #     G(±1,±1)= exp(−2/8) ≈ 0.779   G(0, ±2) = exp(−4/8) ≈ 0.607
+    #     G(±2, 0)= exp(−4/8) ≈ 0.607   G(±2,±2) = exp(−8/8) ≈ 0.368
+    #   After normalising by ΣG≈25.08 the absolute values scale down; relative shape is preserved.
+    #
+    #   Contribution of node A (r_A=1, c_A=1, embedding V_A) to each output pixel:
+    #   Δr = r_A−r = 1−r,  Δc = c_A−c = 1−c  (how far pixel (r,c) is from the node)
+    #
+    #   col →      0              1              2              3              4
+    #   row 0  G(+1,+1)×V_A  G(+1, 0)×V_A  G(+1,−1)×V_A  G(+1,−2)×V_A  G(+1,−3)×V_A
+    #   row 1  G( 0,+1)×V_A      V_A        G( 0,−1)×V_A  G( 0,−2)×V_A  G( 0,−3)×V_A  ← peak (Δr=Δc=0)
+    #   row 2  G(−1,+1)×V_A  G(−1, 0)×V_A  G(−1,−1)×V_A  G(−1,−2)×V_A  G(−1,−3)×V_A
+    #   row 3  G(−2,+1)×V_A  G(−2, 0)×V_A  G(−2,−1)×V_A  G(−2,−2)×V_A  G(−2,−3)×V_A
+    #   row 4  G(−3,+1)×V_A  G(−3, 0)×V_A  G(−3,−1)×V_A  G(−3,−2)×V_A  G(−3,−3)×V_A
+    #
+    #   Node B (r_B=3, c_B=3, embedding V_B) adds V_B×G_norm(3−r, 3−c) to every cell.
+    #   Full output = contribution from A + contribution from B (summed over all N nodes).
+    #
+    # groups=D: each of the D embedding channels is convolved independently with the
+    # same kernel — no cross-channel mixing.  Equivalent to D separate 2D blurs.
+    kernel_size = int(6 * sigma + 1) | 1   # int scalar (always odd) — e.g. σ=2.0 → ks=13, σ=1.5 → ks=11
+    # kernel_size must be ODD so the kernel has a unique centre pixel.
+    # F.conv2d slides the kernel across the input: at each step it places the kernel
+    # centre over one input pixel and computes a weighted sum. With an odd kernel (ks=13),
+    # the centre is at index ks//2 = 6, sitting exactly on an input pixel → no spatial shift.
+    # With an even kernel (ks=12) there is no integer centre: the "centre" falls between two
+    # pixels, shifting the output by 0.5 px and breaking same-size output (output would be
+    # H-1 × W-1 instead of H × W with padding = ks//2 = 6).
+    #
+    # How the formula is derived:
+    #   Truncate at ±3σ — G(±3σ) = exp(−(3σ)²/(2σ²)) = exp(−4.5) ≈ 0.011, negligible tail.
+    #   Span from −3σ to +3σ = 6σ pixels.  Add 1 for the centre pixel → total = 6σ+1.
+    #   int() truncates the float to an integer.
+    #   | 1 forces the result odd via bitwise-OR with 1 (sets the least-significant bit):
+    #     odd  input: 13 in binary = ...01101 → 13 | 1 = ...01101 = 13  (LSB already 1, unchanged)
+    #     even input: 10 in binary = ...01010 → 10 | 1 = ...01011 = 11  (LSB flipped 0→1, adds 1)
+    #
+    #   σ=2.0 → 6×2.0+1=13.0 → int=13 (odd)  → 13|1=13 → ks=13  (covers −6..0..+6 pixels)
+    #   σ=1.5 → 6×1.5+1=10.0 → int=10 (even) → 10|1=11 → ks=11  (covers −5..0..+5 pixels)
+    padding     = kernel_size // 2
+    # same-size padding: F.conv2d with padding=ks//2 produces the same (H, W) output as input.
+    # e.g. ks=13 → padding=6: each border row/column gets 6 zeros added → convolution output stays H×W.
     blur_kernel = _gaussian_kernel(kernel_size, sigma, D).to(device)   # (D, 1, ks, ks)
-    F_scat      = F.conv2d(F_scat, blur_kernel, padding=padding, groups=D)  # depthwise blur per channel
+    F_scat      = F.conv2d(F_scat, blur_kernel, padding=padding, groups=D)  # (1,D,H,W) depthwise blur
 
     return F_scat                               # (1, D, H, W) float32
 
@@ -715,11 +807,106 @@ def _gaussian_kernel(ks, sigma, groups):
     groups=D means each of the D channels gets its own kernel (identical) — efficient.
     Returns (D, 1, ks, ks) float32.
     """
-    coords = torch.arange(ks, dtype=torch.float32) - ks // 2   # (ks,) e.g. [-6,...,0,...,6]
-    g      = torch.exp(-0.5 * (coords / sigma) ** 2)            # (ks,) 1D Gaussian values
-    g      = g / g.sum()                                         # (ks,) normalized so values sum to 1
-    k2d    = g.unsqueeze(0) * g.unsqueeze(1)                     # (ks, ks) outer product → separable 2D Gaussian
-    return k2d.view(1, 1, ks, ks).repeat(groups, 1, 1, 1)       # (groups, 1, ks, ks)
+    coords = torch.arange(ks, dtype=torch.float32) - ks // 2
+    # (ks,) float32 — pixel offsets from kernel centre: 0,1,...,ks-1 shifted by ks//2
+    # e.g. ks=13: arange=[0..12], ks//2=6 → coords=[-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6]
+
+    g = torch.exp(-0.5 * (coords / sigma) ** 2)
+    # (ks,) float32 — 1D Gaussian: G(x) = exp(−x²/(2σ²))
+    # evaluates the standard Gaussian bell curve at each integer offset in coords
+    # e.g. σ=2: G(0)=exp(0)=1.000, G(±1)=exp(−0.125)≈0.882, G(±3)=exp(−1.125)≈0.325, G(±6)=exp(−4.5)≈0.011
+    g = g / g.sum()
+    # (ks,) float32 — normalise so Σg = 1 (the 13 values sum to 1)
+    # required so the convolution preserves mean signal level — without this,
+    # applying the kernel multiplies every pixel by ΣG_2D_unnorm ≈ 25× its value.
+    # Where 25 comes from (σ=2, ks=13):
+    #   1D unnormalized sum Σg_1D = g(-6)+...+g(0)+...+g(+6)
+    #     = 2×(0.011+0.044+0.135+0.325+0.607+0.882) + 1.000 ≈ 5.008
+    #   k2d (built two lines below) is the (ks,ks) 2D kernel matrix where k2d[r,c]=g[r]*g[c]
+    #   — the unnormalized 2D Gaussian.  Centre 7×7 slice (σ=2, offsets −3..+3):
+    #
+    #     r\c   −3      −2      −1       0      +1      +2      +3
+    #      −3  0.106   0.197   0.287   0.325   0.287   0.197   0.106
+    #      −2  0.197   0.368   0.535   0.607   0.535   0.368   0.197
+    #      −1  0.287   0.535   0.778   0.882   0.778   0.535   0.287
+    #       0  0.325   0.607   0.882   1.000   0.882   0.607   0.325   ← centre row (r=0)
+    #      +1  0.287   0.535   0.778   0.882   0.778   0.535   0.287
+    #      +2  0.197   0.368   0.535   0.607   0.535   0.368   0.197
+    #      +3  0.106   0.197   0.287   0.325   0.287   0.197   0.106
+    #
+    #   Each cell follows:  k2d[r,c] = g[r] × g[c] = exp(−r²/8) × exp(−c²/8) = exp(−(r²+c²)/8)
+    #   e.g. k2d[−1, 0] = exp(−1/8) × exp(0)   = 0.882 × 1.000 = 0.882  (one row above centre)
+    #        k2d[−2,+1] = exp(−4/8) × exp(−1/8) = 0.607 × 0.882 = 0.535  (two up, one right)
+    #   The full 13×13 k2d has 169 cells; total sum derived by factoring the double sum:
+    #     Σk2d = Σ_r Σ_c k2d[r,c]
+    #          = Σ_r Σ_c g[r]*g[c]      (substitute definition k2d[r,c]=g[r]*g[c])
+    #          = Σ_r g[r] * (Σ_c g[c])  (g[r] is constant w.r.t. the inner sum over c)
+    #          = Σ_r g[r] * Σg_1D       (Σ_c g[c] = Σg_1D, same 1D sum for every row)
+    #          = Σg_1D * Σg_1D          (pull out the constant Σg_1D from the outer sum)
+    #          = (Σg_1D)² = 5.008² ≈ 25.08
+
+    # A 2D Gaussian is separable: G2D(r,c) = exp(−(r²+c²)/(2σ²))
+    #                                       = exp(−r²/(2σ²)) × exp(−c²/(2σ²))
+    #                                       = G1D(r) × G1D(c)
+    # So every cell (r,c) of the 2D kernel is just two independent 1D lookups multiplied.
+    # The outer product of g with itself fills the whole matrix in one operation:
+    #
+    #   Outer product: take g as a column vector and g as a row vector, multiply:
+    #
+    #              g[0]   g[1]   g[2]      ← row vector  (1, ks)  g.unsqueeze(0)
+    #   g[0]  [ g[0]×g[0]  g[0]×g[1]  g[0]×g[2] ]
+    #   g[1]  [ g[1]×g[0]  g[1]×g[1]  g[1]×g[2] ]   ← k2d, shape (ks, ks)
+    #   g[2]  [ g[2]×g[0]  g[2]×g[1]  g[2]×g[2] ]
+    #     ↑
+    #   column vector (ks, 1)  g.unsqueeze(1)
+    #
+    #   k2d[i,j] = g[i] × g[j] = G1D(offset_i) × G1D(offset_j) = G2D(offset_i, offset_j)
+    #   Every cell lands on the correct 2D Gaussian value — no loop needed.
+    k2d = g.unsqueeze(0) * g.unsqueeze(1)
+    # g.unsqueeze(0): (ks,) → (1, ks)  — row vector
+    # g.unsqueeze(1): (ks,) → (ks, 1)  — column vector
+    # broadcasting (1,ks)×(ks,1) → (ks,ks): k2d[r,c] = g[r] * g[c]
+    # e.g. ks=13, σ=2:
+    #   k2d[0,0] = g[-6]*g[-6] = 0.011*0.011 ≈ 0.000  (corner — very far from centre)
+    #   k2d[6,6] = g[ 0]*g[ 0] = 1.000*1.000 = 1.000  (centre — peak, before normalisation)
+    #   k2d[6,7] = g[ 0]*g[+1] = 1.000*0.882 ≈ 0.882  (one step right of centre)
+
+    return k2d.view(1, 1, ks, ks).repeat(groups, 1, 1, 1)
+    # F.conv2d weight format requires (out_channels, in_channels/groups, kH, kW).
+    # With groups=D the input (1,D,H,W) is split into D single-channel groups, so
+    # in_channels/groups = 1 and out_channels = D → weight must be (D, 1, ks, ks).
+    #
+    # Step 1 — view(1,1,ks,ks): insert the two leading channel dims:
+    #
+    #   k2d (ks,ks)         →   view   →   (1, 1, ks, ks)≠
+    #   ┌───────────┐               out[0], in[0]
+    #   │ · · · · · │               ┌───────────┐
+    #   │ · · G · · │               │ · · · · · │
+    #   │ · · · · · │               │ · · G · · │
+    #   └───────────┘               │ · · · · · │
+    #   single 2D matrix            └───────────┘
+    #                               one kernel, one in-channel slot
+    #
+    # Step 2 — repeat(D,1,1,1): stack D identical copies along dim 0 (out-channel dim):
+    #
+    #   repeat(D, 1, 1, 1): each argument is how many times to repeat along that dim
+#     dim 0 (out-channels): repeat D times → size 1 → size D  (stack D copies)
+#     dim 1 (in-channels) : repeat 1 time  → size 1 → size 1  (unchanged)
+#     dim 2 (kH)          : repeat 1 time  → size ks→ size ks (unchanged)
+#     dim 3 (kW)          : repeat 1 time  → size ks→ size ks (unchanged)
+#
+#   (1,1,ks,ks)  →  repeat(D,1,1,1)  →  (D, 1, ks, ks)
+    #
+    #   kernel[0]  kernel[1]  ...  kernel[D-1]     ← D identical copies
+    #   ┌───────┐  ┌───────┐       ┌───────┐
+    #   │ · G · │  │ · G · │  ...  │ · G · │
+    #   └───────┘  └───────┘       └───────┘
+    #      ↓           ↓                ↓
+    #   channel 0  channel 1  ...  channel D-1   of F_scat
+    #
+    # F.conv2d with groups=D: kernel[d] is applied only to F_scat[0,d,:,:].
+    # Each embedding channel is blurred independently with the same Gaussian —
+    # no mixing between channels 0..D-1.
 
 
 # ── Joint Model ────────────────────────────────────────────────────────────────
@@ -738,10 +925,10 @@ class VesselSegNet(nn.Module):
             │                                      │
         CNN upsampling                       Graph path
         feats[0] → ConvT×2                   coarse mask → skeletonize → sknw
-        (B,256,H/4,W/4)→(B,32,H,W)          build 41-dim node features:
-        F_pixel                                position, direction, diameter,
+        (B,256,H/4,W/4)→(B,32,H,W)          build 39-dim node features:
+        F_pixel                                direction(cos,sin), diameter,
                                                curvature, degree, component_size,
-                                               endpoint_distance, diameter_std, CNN(32)
+                                               diameter_std, CNN(32)
                                              ChebConv(K=10) × 3 layers
                                              (N,39)→(N,64)
                                              scatter+Gaussian → (B,64,H,W)
