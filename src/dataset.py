@@ -116,7 +116,9 @@ def load_pairs(input_dir, output_dir):
     Returns sorted list of (img_path, mask_path) tuples.
     """
     def by_id(folder):
-        files = glob.glob(os.path.join(folder, '*.tif'))
+        # ** with recursive=True descends into subdirectories (D7/, D14/, D21/)
+        # so all timepoint folders are searched without flattening the data layout.
+        files = glob.glob(os.path.join(folder, '**', '*.tif'), recursive=True)
         d = {}
         for f in files:
             try:

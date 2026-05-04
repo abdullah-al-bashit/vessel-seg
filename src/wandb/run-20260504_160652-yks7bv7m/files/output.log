@@ -1,0 +1,16 @@
+
+═══ Fold 1/5 ═══
+  Train tiles: 480  |  Val tiles: 120
+Traceback (most recent call last):
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/train.py", line 276, in <module>
+    main(args)
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/train.py", line 163, in main
+    model     = VesselSegNet().to(device)
+                ^^^^^^^^^^^^^^
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/model.py", line 948, in __init__
+    self.encoder   = SAM2Encoder()                                          # frozen Hiera ViT-L
+                     ^^^^^^^^^^^^^
+  File "/Users/bashit.a/Downloads/vessel_seg_github/src/model.py", line 60, in __init__
+    from transformers import Sam2Model, Sam2Processor  # lazy import — avoids load at module level
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'transformers'

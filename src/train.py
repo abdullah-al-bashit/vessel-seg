@@ -1,4 +1,5 @@
 import os
+import json
 import argparse
 import random  # used in set_seed
 import numpy as np
@@ -12,6 +13,7 @@ from tqdm import tqdm
 from dataset import load_pairs, VesselDataset
 from model   import VesselSegNet
 from loss    import VesselLoss
+import wandb
 
 SEED          = 42   # single source of truth for all random seeds throughout training
 N_FOLDS       = 5    # number of cross-validation folds
@@ -48,7 +50,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True):
             msk  = msk.to(device)
             hann = hann.to(device)
 
-            with autocast(enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 logits = model(img)
                 loss, loss_dict = criterion(logits, msk, hann)
 
@@ -91,10 +93,46 @@ def main(args):
     # e.g. pairs=30 → trainval_pairs=[('1_img.tif','1_msk.tif'), ...] (24 items), test_pairs=[('7_img.tif','7_msk.tif'), ...] (6 items)
     print(f'Train+val pairs: {len(trainval_pairs)}  |  Test pairs: {len(test_pairs)}')
 
+    # ── W&B run — one run covers all folds + final test ───────────────────────
+    wandb.init(
+        project = "vessel-seg",
+        config  = {
+            "seed":           SEED,
+            "n_folds":        N_FOLDS,
+            "test_split":     TEST_SPLIT,
+            "patience":       PATIENCE,
+            "lambda_cldice":  LAMBDA_CLDICE,
+            "epochs":         args.epochs,
+            "batch_size":     args.batch_size,
+            "lr":             args.lr,
+        }
+    )
+
     # 5-fold CV on image-level pairs (not tile-level) to avoid data leakage
     kf           = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)  # splitter object — actual split happens at kf.split() below
     pair_indices = list(range(len(trainval_pairs)))  # e.g. [0, 1, 2, ..., 23] for 24 trainval pairs
     best_loss_folds = []                             # best val loss per fold — used to select fold for test evaluation
+
+    # Log every file's role (fold number + train/val/test) in one Table.
+    # wandb.Table stores string data properly — wandb.log() with strings or lists
+    # would be treated as metrics and silently dropped or misrepresented.
+    # fold=0 marks the held-out test set (never used during training).
+    split_table = wandb.Table(columns=["fold", "split", "file"])
+    for fold_i, (tr_idx, va_idx) in enumerate(kf.split(pair_indices)):
+        for i in tr_idx:
+            split_table.add_data(fold_i + 1, "train", trainval_pairs[i][0])
+        for i in va_idx:
+            split_table.add_data(fold_i + 1, "val",   trainval_pairs[i][0])
+    for p in test_pairs:
+        split_table.add_data(0, "test", p[0])
+    wandb.log({"data_splits": split_table})
+
+    # Save filename → split label so predict.py can label each image in the W&B
+    # Media panel without needing to know which folder is test vs trainval.
+    splits_info = {os.path.basename(p[0]): "trainval" for p in trainval_pairs}
+    splits_info.update({os.path.basename(p[0]): "test" for p in test_pairs})
+    with open(os.path.join(args.ckpt_dir, "data_splits.json"), "w") as f:
+        json.dump(splits_info, f, indent=2)
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(pair_indices)):
         # kf.split yields 5 rounds; each round rotates which 1/5 of pair_indices is val_idx,
@@ -150,6 +188,19 @@ def main(args):
                   f'val   loss {va_loss:.4f} '
                   f'(soft_dice={va_parts["dice"]:.3f} bce={va_parts["bce"]:.3f} cldice={va_parts["cldice"]:.3f})')
 
+            # fold-prefixed metrics so all 5 folds are visible as separate curves in W&B
+            wandb.log({
+                "epoch":                         epoch,
+                f"fold{fold+1}/train_loss":      tr_loss,
+                f"fold{fold+1}/train_dice":      tr_parts["dice"],
+                f"fold{fold+1}/train_bce":       tr_parts["bce"],
+                f"fold{fold+1}/train_cldice":    tr_parts["cldice"],
+                f"fold{fold+1}/val_loss":        va_loss,
+                f"fold{fold+1}/val_dice":        va_parts["dice"],
+                f"fold{fold+1}/val_bce":         va_parts["bce"],
+                f"fold{fold+1}/val_cldice":      va_parts["cldice"],
+            })
+
             # model selection and early stopping based on full val loss (VesselLoss)
             if va_loss < best_loss:
                 best_loss  = va_loss
@@ -157,6 +208,12 @@ def main(args):
                 ckpt_path  = os.path.join(args.ckpt_dir, f'fold{fold+1}_best.pth')
                 torch.save(model.state_dict(), ckpt_path)
                 print(f'  ✓ saved {ckpt_path}  (val loss {best_loss:.4f})')
+                # Artifact: uploads the checkpoint file to W&B so it's stored with
+                # this run and downloadable by name — no need to track file paths manually
+                artifact = wandb.Artifact(f"fold{fold+1}_best", type="model",
+                                          description=f"fold{fold+1} best checkpoint, val_loss={best_loss:.4f}")
+                artifact.add_file(ckpt_path)
+                wandb.log_artifact(artifact)
             else:
                 no_improve += 1
                 if no_improve >= PATIENCE:
@@ -165,6 +222,7 @@ def main(args):
 
         best_loss_folds.append(best_loss)
         print(f'Fold {fold+1} best val loss: {best_loss:.4f}')
+        wandb.log({f"fold{fold+1}/best_val_loss": best_loss})
 
     print(f'\n5-fold CV val loss: {np.mean(best_loss_folds):.4f} '
           f'± {np.std(best_loss_folds):.4f}')
@@ -189,6 +247,17 @@ def main(args):
                                    None, None, device, train=False)
     print(f'Test loss {te_loss:.4f} '
           f'(soft_dice={te_parts["dice"]:.3f} bce={te_parts["bce"]:.3f} cldice={te_parts["cldice"]:.3f})')
+
+    wandb.log({
+        "test/loss":        te_loss,
+        "test/dice":        te_parts["dice"],
+        "test/bce":         te_parts["bce"],
+        "test/cldice":      te_parts["cldice"],
+        "best_fold":        best_fold,
+        "cv_mean_val_loss": float(np.mean(best_loss_folds)),
+        "cv_std_val_loss":  float(np.std(best_loss_folds)),
+    })
+    wandb.finish()   # marks the run complete and uploads any remaining data
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

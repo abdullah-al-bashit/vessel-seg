@@ -1,0 +1,52 @@
+{
+  "os":  "macOS-13.7.8-arm64-arm-64bit",
+  "python":  "CPython 3.11.5",
+  "startedAt":  "2026-05-04T20:08:43.945460Z",
+  "args":  [
+    "--input_dir",
+    "../data/images",
+    "--output_dir",
+    "../data/masks",
+    "--ckpt_dir",
+    "../checkpoints",
+    "--epochs",
+    "1",
+    "--batch_size",
+    "2",
+    "--lr",
+    "1e-4"
+  ],
+  "program":  "/Users/bashit.a/Downloads/vessel_seg_github/src/train.py",
+  "codePath":  "src/train.py",
+  "codePathLocal":  "train.py",
+  "git":  {
+    "remote":  "git@github.com:abdullah-al-bashit/vessel-seg.git",
+    "commit":  "68230942a75b16e503f8a0df2d7e35627f19162b"
+  },
+  "email":  "eeebashit@gmail.com",
+  "root":  "/Users/bashit.a/Downloads/vessel_seg_github/src",
+  "host":  "FACC02F22KKQ05N.tld",
+  "executable":  "/Users/bashit.a/miniforge3/envs/pytorch_env/bin/python",
+  "cpu_count":  8,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "994662584320",
+      "used":  "971634671616"
+    }
+  },
+  "memory":  {
+    "total":  "17179869184"
+  },
+  "apple":  {
+    "name":  "Apple M1",
+    "ecpuCores":  4,
+    "pcpuCores":  4,
+    "gpuCores":  8,
+    "memoryGb":  16,
+    "swapTotalBytes":  "23622320128",
+    "ramTotalBytes":  "17179869184",
+    "macModel":  "MacBookPro17,1"
+  },
+  "writerId":  "k3sb017xput0x1bbk0rastb8iom2yomj"
+}
