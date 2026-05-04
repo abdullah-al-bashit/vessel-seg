@@ -16,12 +16,12 @@ module load explorer
 module load anaconda3/2024.06
 module load cuda/12.1.1
 
-source activate vessel_seg
+source activate pytorch_env
 
 # ── HuggingFace cache → scratch (more space than home) ────────────────────────
 export HF_HOME=/scratch/$USER/.cache/huggingface
 
-cd /scratch/$USER/vessel_seg
+cd /home/$USER/vessel_seg
 
 # ── Verify GPU + CUDA ──────────────────────────────────────────────────────────
 echo "Job ID:    $SLURM_JOB_ID"
