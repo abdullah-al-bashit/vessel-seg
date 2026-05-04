@@ -1,16 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=vessel_seg
-#SBATCH --partition=gpu
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:a100:1
-#SBATCH --mem=64G
-#SBATCH --time=24:00:00
 #SBATCH --output=../logs/train_%j.out
 #SBATCH --error=../logs/train_%j.err
-#SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@northeastern.edu
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --time=02:00:00
+#SBATCH --mem=32G
+#SBATCH --cpus-per-task=4
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=a.bashit@northeastern.edu
 
 # ── Explorer modules ───────────────────────────────────────────────────────────
 module purge
@@ -34,16 +32,16 @@ python -c "import torch; print(f'PyTorch {torch.__version__}  CUDA: {torch.cuda.
 echo "Start:     $(date)"
 
 # ── Paths — EDIT THESE ─────────────────────────────────────────────────────────
-INPUT_DIR="../Input/D7"
-OUTPUT_DIR="../Output/D7"
+INPUT_DIR="../data/images"
+OUTPUT_DIR="../data/masks"
 CKPT_DIR="../checkpoints"
 
-# ── Training (no --sam2_ckpt needed — HuggingFace auto-downloads) ─────────────
+# ── Training (1-epoch sanity check; bump --epochs once it runs cleanly) ───────
 python src/train.py \
     --input_dir   $INPUT_DIR  \
     --output_dir  $OUTPUT_DIR \
     --ckpt_dir    $CKPT_DIR   \
-    --epochs      200         \
+    --epochs      1           \
     --batch_size  2           \
     --lr          1e-4
 
