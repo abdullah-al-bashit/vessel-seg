@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import argparse
 import random  # used in set_seed
 import numpy as np
@@ -10,9 +11,12 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import KFold, train_test_split
 from tqdm import tqdm
 
+from tifffile import imread as tif_imread
+
 from dataset import load_pairs, VesselDataset
 from model   import VesselSegNet
 from loss    import VesselLoss
+from predict import predict_image  # full-image stitched inference for test Dice
 import wandb
 
 SEED          = 42   # single source of truth for all random seeds throughout training
@@ -100,6 +104,7 @@ def main(args):
 
     # ── W&B run — one run covers all folds + final test ───────────────────────
     wandb.init(
+        entity  = "eeebashit",
         project = "vessel-seg",
         config  = {
             "seed":           SEED,
@@ -140,6 +145,10 @@ def main(args):
         json.dump(splits_info, f, indent=2)
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(pair_indices)):
+        # --folds lets you stop after the first N folds (still uses 5-way split → 80/20 ratio).
+        # e.g. --folds 1 trains exactly one fold on 80% of trainval, validated on the remaining 20%.
+        if fold >= args.folds:
+            break
         # kf.split yields 5 rounds; each round rotates which 1/5 of pair_indices is val_idx,
         # the other 4/5 become train_idx — e.g. fold 0: val_idx=[0..4], train_idx=[5..23]
 
@@ -181,17 +190,26 @@ def main(args):
         for epoch in range(1, args.epochs + 1):
             train_ds.seed = SEED + epoch  # vary augmentations each epoch
 
+            # Wall-clock per-phase timing — used for accurate runtime estimation
+            t_train_start = time.perf_counter()
             tr_loss, tr_parts = run_epoch(model, train_loader, criterion,
                                           optimizer, scaler, device, train=True)
+            t_train = time.perf_counter() - t_train_start
+
+            t_val_start = time.perf_counter()
             va_loss, va_parts = run_epoch(model, val_loader,   criterion,
                                           None,    None,       device, train=False)
+            t_val = time.perf_counter() - t_val_start
             scheduler.step()
+
+            t_epoch = t_train + t_val
 
             print(f'Epoch {epoch:3d} | '
                   f'train loss {tr_loss:.4f} '
                   f'(soft_dice={tr_parts["dice"]:.3f} bce={tr_parts["bce"]:.3f} cldice={tr_parts["cldice"]:.3f}) | '
                   f'val   loss {va_loss:.4f} '
-                  f'(soft_dice={va_parts["dice"]:.3f} bce={va_parts["bce"]:.3f} cldice={va_parts["cldice"]:.3f})')
+                  f'(soft_dice={va_parts["dice"]:.3f} bce={va_parts["bce"]:.3f} cldice={va_parts["cldice"]:.3f}) | '
+                  f'time {t_epoch:.1f}s (train {t_train:.1f}s, val {t_val:.1f}s)')
 
             # fold-prefixed metrics so all 5 folds are visible as separate curves in W&B
             wandb.log({
@@ -203,6 +221,9 @@ def main(args):
                 f"fold{fold+1}/val_loss":        va_loss,
                 f"fold{fold+1}/val_dice":        va_parts["dice"],
                 f"fold{fold+1}/val_bce":         va_parts["bce"],
+                f"fold{fold+1}/epoch_time_s":    t_epoch,
+                f"fold{fold+1}/train_time_s":    t_train,
+                f"fold{fold+1}/val_time_s":      t_val,
                 f"fold{fold+1}/val_cldice":      va_parts["cldice"],
             })
 
@@ -253,14 +274,33 @@ def main(args):
     print(f'Test loss {te_loss:.4f} '
           f'(soft_dice={te_parts["dice"]:.3f} bce={te_parts["bce"]:.3f} cldice={te_parts["cldice"]:.3f})')
 
+    # ── Stitched-image Dice on test set (interpretable 0-1 metric) ────────────
+    # te_loss above is computed on tile-level patches with Hanning weighting,
+    # so its components fall outside [0, 1]. To report a standard Dice score,
+    # run inference on each full test image (predict_image stitches tiles back
+    # into a (H, W) binary mask) and compare against the ground-truth mask.
+    print('\nStitched-image Dice on test set:')
+    dice_per_image = []
+    for img_path, msk_path in test_pairs:
+        pred_mask = predict_image(model, img_path, device)        # (H, W) bool
+        gt_mask   = tif_imread(msk_path) > 0                       # (H, W) bool
+        inter     = float(np.logical_and(pred_mask, gt_mask).sum())
+        denom     = float(pred_mask.sum() + gt_mask.sum())
+        dice      = (2.0 * inter) / (denom + 1e-8)                 # standard Dice ∈ [0, 1]
+        dice_per_image.append(dice)
+        print(f'  {os.path.basename(img_path):40s} dice = {dice:.4f}')
+    mean_test_dice = float(np.mean(dice_per_image))
+    print(f'Mean test Dice (stitched, unweighted): {mean_test_dice:.4f}')
+
     wandb.log({
-        "test/loss":        te_loss,
-        "test/dice":        te_parts["dice"],
-        "test/bce":         te_parts["bce"],
-        "test/cldice":      te_parts["cldice"],
-        "best_fold":        best_fold,
-        "cv_mean_val_loss": float(np.mean(best_loss_folds)),
-        "cv_std_val_loss":  float(np.std(best_loss_folds)),
+        "test/loss":             te_loss,
+        "test/dice":             te_parts["dice"],
+        "test/bce":              te_parts["bce"],
+        "test/cldice":           te_parts["cldice"],
+        "test/dice_stitched":    mean_test_dice,        # standard Dice ∈ [0, 1] — clinically interpretable
+        "best_fold":             best_fold,
+        "cv_mean_val_loss":      float(np.mean(best_loss_folds)),
+        "cv_std_val_loss":       float(np.std(best_loss_folds)),
     })
     wandb.finish()   # marks the run complete and uploads any remaining data
 
@@ -273,6 +313,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--ckpt_dir',   default='../checkpoints')
     parser.add_argument('--epochs',     type=int, default=200)
+    parser.add_argument('--folds',      type=int, default=N_FOLDS,
+                        help='Train at most this many folds (still uses 5-way 80/20 split)')
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--lr',         type=float, default=1e-4)
     args = parser.parse_args()

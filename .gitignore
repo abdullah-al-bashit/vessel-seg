@@ -40,6 +40,12 @@ logs/
 *.out
 *.err
 
+# W&B run artefacts (large; uploaded to wandb.ai cloud)
+wandb/
+
+# Claude Code local state
+.claude/
+
 # HuggingFace cache
 .cache/
 
