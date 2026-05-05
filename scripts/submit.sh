@@ -4,7 +4,7 @@
 #SBATCH --error=/home/a.bashit/vessel_seg/logs/train_%j.err
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=02:00:00
+#SBATCH --time=08:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --mail-type=END,FAIL
@@ -22,6 +22,7 @@ source activate pytorch_env
 
 # ── HuggingFace cache → scratch (more space than home) ────────────────────────
 export HF_HOME=/scratch/$USER/.cache/huggingface
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd /home/$USER/vessel_seg
 
@@ -33,19 +34,28 @@ echo "CUDA:      $(python -c 'import torch; print(torch.version.cuda)')"
 python -c "import torch; print(f'PyTorch {torch.__version__}  CUDA: {torch.cuda.is_available()}  {torch.cuda.get_device_name(0)}')"
 echo "Start:     $(date)"
 
-# ── Paths — EDIT THESE ─────────────────────────────────────────────────────────
+# ── Paths ──────────────────────────────────────────────────────────────────────
 INPUT_DIR="data/images"
 OUTPUT_DIR="data/masks"
 CKPT_DIR="checkpoints"
 
-# ── 2 epochs / 1 fold / bs=4 — quick training run before prediction demo ─────
+# ── Train ─────────────────────────────────────────────────────────────────────
 python src/train.py \
     --input_dir   $INPUT_DIR  \
     --output_dir  $OUTPUT_DIR \
     --ckpt_dir    $CKPT_DIR   \
     --folds       1           \
-    --epochs      2           \
-    --batch_size  4           \
+    --epochs      1           \
+    --batch_size  8           \
     --lr          1e-4
+
+echo "Training done: $(date)"
+
+# ── Predict: run on all images using best checkpoint ──────────────────────────
+python src/predict.py \
+    --input_dir  $INPUT_DIR          \
+    --mask_dir   $OUTPUT_DIR         \
+    --ckpt_path  $CKPT_DIR/fold1_best.pth \
+    --out_dir    predictions
 
 echo "Done: $(date)"

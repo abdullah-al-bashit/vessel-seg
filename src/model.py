@@ -6,9 +6,13 @@ import networkx as nx                                    # connected-component a
 from torch_geometric.nn import ChebConv                 # Chebyshev spectral graph convolution
 from skimage.morphology import skeletonize               # morphological thinning → 1px centerline
 from torchvision.transforms.functional import to_pil_image   # tensor → PIL for SAM2 processor
-import sknw                                              # skeleton → networkx graph (nodes=junctions/tips, edges=vessel segments)
+import skan                                              # skeleton → graph; replaces sknw which had unfixed C-level heap-corruption bug
+                                                          # (sknw issue #1: out-of-bounds writes in fill/trace buf on 1024+px inputs)
+from scipy.ndimage import distance_transform_edt         # vessel radius map; one module-level import avoids re-importing on every forward pass
 
-HF_MODEL_ID = "facebook/sam2.1-hiera-large"             # SAM2.1 Hiera-Large — newest checkpoint on HuggingFace
+HF_MODEL_ID = "facebook/sam2.1-hiera-tiny"              # SAM2.1 Hiera-Tiny — smallest variant (~38M params encoder)
+                                                         # ~5–8× faster than Hiera-Large, slight Dice cost.
+                                                         # Other options: sam2.1-hiera-{tiny,small,base-plus,large}
 
 # ── Feature dimensions ─────────────────────────────────────────────────────────
 # Node features (39 total):
@@ -129,6 +133,63 @@ class CNNDecoder(nn.Module):
         return x                 # (B, 32, 1024, 1024) — pixel-aligned at SAM2 resolution
 
 
+# ── Skeleton → networkx graph (skan-based replacement for sknw) ───────────────
+
+def _skel_to_graph(skel):
+    """
+    Convert a binary skeleton image into a networkx graph in the SAME shape as
+    sknw.build_sknw used to produce, but using skan's stable Cython backend
+    (no segfault on 1024+px images — sknw issue #1 is unfixed for years).
+
+    skel: (H, W) bool — 1-pixel skeleton from skimage.morphology.skeletonize
+    Returns: networkx.Graph or None (when skeleton has < 2 pixels / no edges)
+
+    Output graph contract (matches what the rest of build_vessel_graph expects):
+      graph.nodes[n]['o']   = (row, col) int pixel position of node n
+      graph[u][v]['pts']    = (L, 2) int64 array of INTERIOR path pixels
+                              (the endpoints u, v themselves are NOT in pts —
+                               same convention as sknw)
+      graph.nodes()         = integer IDs (skan's pixel-into-coordinates index)
+      graph.degree(n)       = number of edges at node n
+    """
+    skel_bool = np.ascontiguousarray(skel.astype(bool))
+    if skel_bool.sum() < 2:
+        return None                                           # nothing to graph
+
+    skel_obj = skan.Skeleton(skel_bool)
+    if skel_obj.n_paths == 0:
+        return None
+
+    # skan.summarize returns one row per branch (= one edge in the graph), with
+    # node-id-{src,dst} pointing into skel_obj.coordinates. separator='_' makes
+    # the column names stable across skan versions (e.g. 'node_id_src').
+    summary = skan.summarize(skel_obj, separator='_')
+    if len(summary) == 0:
+        return None
+
+    coords = skel_obj.coordinates                             # (N_skel, 2) int — all skeleton pixel coords (row, col)
+
+    G = nx.Graph()
+    for i in range(len(summary)):
+        src = int(summary['node_id_src'].iloc[i])
+        dst = int(summary['node_id_dst'].iloc[i])
+
+        # Add nodes (idempotent in networkx). 'o' attribute mirrors sknw's
+        # node-position field used by the feature extraction below.
+        G.add_node(src, o=tuple(int(c) for c in coords[src]))
+        G.add_node(dst, o=tuple(int(c) for c in coords[dst]))
+
+        # path_coordinates returns the full pixel chain INCLUDING both endpoint
+        # nodes. Strip the endpoints so 'pts' contains only interior pixels —
+        # that matches sknw's convention. int64 to dodge any int16 overflow.
+        path = skel_obj.path_coordinates(i).astype(np.int64)
+        interior = path[1:-1] if len(path) > 2 else path
+
+        G.add_edge(src, dst, pts=interior)
+
+    return G
+
+
 # ── Graph Construction ─────────────────────────────────────────────────────────
 
 def build_vessel_graph(mask_np, img_np, pixel_feats_np):
@@ -175,8 +236,15 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
     # Repeatedly erodes the vessel mask inward until only a 1-pixel-wide spine remains.
     # True pixels = centerline; False = background or vessel interior that was eroded away.
     # e.g. a 10px-wide vessel region becomes a single-pixel chain running down its center.
-    skel  = skeletonize(mask_np) 
-    # (H, W) bool — same spatial size as mask_np; True only on the 1px centerline
+    # Downsample 4× before skeletonizing: ~16× fewer skeleton pixels → ~16× faster
+    # skeletonize + skan, which is the dominant cost per batch. Vessel topology
+    # (junctions, tips, branches) is preserved at quarter resolution. Node positions
+    # are scaled ×4 back to full-res before returning, so they stay pixel-aligned
+    # with F_pixel and img_np (±3 px error max — acceptable given vessel widths of 10–50 px).
+    # dist is still computed on the full-res mask so vessel-radius values are accurate.
+    mask_small = mask_np[::4, ::4]                               # (H/4, W/4) bool — 4× downsampled
+    skel  = skeletonize(np.ascontiguousarray(mask_small))
+    # (H/2, W/2) bool — True only on the 1px centerline of the downsampled mask
 
     # Convert the skeleton pixel image into a graph of vessel topology.
     # sknw scans the skeleton for pixels with unusual connectivity:
@@ -219,9 +287,84 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
     #                           branch 0: tip0 ── pts_0 (L0 pixels) ── junction
     #                           branch 1: tip1 ── pts_1 (L1 pixels) ── junction
     #                           branch 2: tip2 ── pts_2 (L2 pixels) ── junction
-    graph = sknw.build_sknw(skel.astype(np.uint16))
-    # sknw requires uint16 input; bool skel cast to 0/1 uint16
-    # returns networkx.Graph; node IDs are integers 0,1,2,... assigned by sknw
+    # Use the skan-based wrapper instead of sknw.build_sknw — same networkx
+    # output contract, but built on skan's stable Cython backend rather than
+    # sknw's numba-jitted fill/trace which segfault on 1024+px images.
+    graph = _skel_to_graph(skel)
+    if graph is None or len(graph.nodes()) < 2:
+        return None
+
+    # ── Prune spurious stub branches ───────────────────────────────────────
+    # A noisy coarse mask generates many short leaf branches at junctions —
+    # 1-pixel protrusions that skan traces as degree-1 nodes connected by a
+    # short edge. These add nodes without topological meaning and dominate
+    # the graph size on early-training coarse masks.
+    #
+    # How edge length is measured:
+    #   skan stores only the INTERIOR pixels of each edge in pts (endpoints excluded).
+    #   e.g. a path  L(row=0,col=7) → ●(row=1,col=7) → J(row=2,col=7)
+    #        has total 3 pixels, but pts = [[1,7]]  shape (1, 2)  → len(pts)=1
+    #   We use len(pts) as the edge-length proxy (number of interior pixels).
+    #
+    # Example — main vessel with two stubs hanging off J (all at col=7):
+    #
+    #   col →  0    1    2    3    4    5    6    7    8    9   10   11   12   13   14
+    #   row 0  .    .    .    .    .    .    .    L    .    .    .    .    .    .    .
+    #   row 1  .    .    .    .    .    .    .    ●    .    .    .    .    .    .    .   ← 1 interior pixel
+    #   row 2  .    n────p────p────p────p────p────J────p────p────p────p────p────p────n
+    #   row 3  .    .    .    .    .    .    .    ●    .    .    .    .    .    .    .   ← 1 interior pixel
+    #   row 4  .    .    .    .    .    .    .    L    .    .    .    .    .    .    .
+    #
+    #   n  = real endpoint node  (degree=1, row=2)
+    #   J  = junction node       (degree=3, row=2, col=7)
+    #   L  = STUB leaf node      (degree=1)
+    #   ●  = single interior pixel of the stub edge
+    #   p  = interior pixel of a real vessel edge (not a node)
+    #
+    #   Top stub    L(row=0,col=7) ── J(row=2,col=7):   pts=[[1,7]]            len(pts)=1 < 5 → PRUNE
+    #   Bottom stub L(row=4,col=7) ── J(row=2,col=7):   pts=[[3,7]]            len(pts)=1 < 5 → PRUNE
+    #   Left edge   n(row=2,col=1) ── J(row=2,col=7):   pts=[[2,2]..[2,6]]    len(pts)=5 ≥ 5 → keep
+    #   Right edge  J(row=2,col=7) ── n(row=2,col=14):  pts=[[2,8]..[2,13]]   len(pts)=6 ≥ 5 → keep
+    #
+    # Why iterate? Removing a stub can expose a NEW leaf from its former neighbour.
+    # Example — chain of two stubs both at col=7:
+    #
+    #   col →  0    1    2    3    4    5    6    7    8    9   10   11
+    #   row 0  .    .    .    .    .    .    .    L₂   .    .    .    .
+    #   row 1  .    .    .    .    .    .    .    ●    .    .    .    .
+    #   row 2  .    .    .    .    .    .    .    L₁   .    .    .    .
+    #   row 3  .    .    .    .    .    .    .    ●    .    .    .    .
+    #   row 4  .    n────p────p────p────p────p────J────p────p────p────n
+    #
+    #   before:  L₂(deg=1)──L₁(deg=2)──J(deg=3)──n
+    #   iter 1:  L₂ leaf, L₂──L₁ pts=[[1,7]] len=1 < 5 → remove L₂
+    #            → L₁ now degree=1 (was 2: one edge to L₂ gone, one to J remains)
+    #   iter 2:  L₁ leaf, L₁──J  pts=[[3,7]] len=1 < 5 → remove L₁
+    #            → J.degree drops 3→2, not a leaf → stop
+    #
+    # MIN_STUB_PTS=5 interior px in 4× downsampled space ≈ 20 full-res pixels along the path.
+    # Real vessel tips don't terminate after <20 px; anything shorter is boundary noise.
+    MIN_STUB_PTS = 5
+    # Repeatedly scan all nodes; remove any leaf whose connecting edge is shorter than
+    # MIN_STUB_PTS interior pixels. Loop until a full pass finds nothing to prune —
+    # needed because each removal can turn a non-leaf into a new leaf (chain effect above).
+    pruned = True
+    while pruned:
+        pruned = False
+        for n in list(graph.nodes()):       # list() snapshot — graph mutates inside loop; iterating live view raises RuntimeError
+            if graph.degree(n) == 1:        # leaf: exactly one edge at n
+                                            #   degree=2 → straight interior node (skip)
+                                            #   degree≥3 → junction (skip)
+                nb  = next(iter(graph.neighbors(n)))            # scalar int — the single neighbour of leaf n
+                                                                #   e.g. n=L(row=0,col=7), nb=J(row=2,col=7)
+                pts = graph[n][nb].get('pts', np.array([]))     # (len(pts), 2) int64 — interior pixels on n──nb
+                                                                #   top stub: pts=[[1,7]] shape (1,2), len=1
+                                                                #   right real edge: pts=[[2,8]..[2,13]] shape (6,2), len=6
+                if len(pts) < MIN_STUB_PTS: # 1 < 5 → stub → prune
+                    graph.remove_node(n)    # removes n AND its single edge n──nb
+                    pruned = True           # nb may now be a new leaf → re-scan
+    # returns networkx.Graph; node IDs are skeleton-pixel indices into
+    # skan.Skeleton.coordinates (not necessarily 0,1,2,...)
     #
     #   n, u, v are all the SAME type: sknw integer node IDs from the same pool {0,1,2,...}
     #   n   = used alone  → look up one node's pixel position
@@ -241,7 +384,7 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         return None               # need ≥2 nodes to have any edge; 0 or 1 node → no message passing possible
 
     # ── Pre-compute distance transform once (reused for diameter + consistency) ──
-    from scipy.ndimage import distance_transform_edt
+    # Always on full-res mask so vessel-radius values are accurate (not halved by downsampling).
     dist = distance_transform_edt(mask_np)
     # (H, W) float64 — each pixel's Euclidean distance to the nearest background (False) pixel
     #
@@ -296,10 +439,14 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
     node_feats = []    # list[ndarray(39,)];     one 39-dim vec  per node → np.array → (N, 39) float32
 
     for n in nodes:
-        y, x = graph.nodes[n]['o']                   # (2,) — skeleton node position as (row, col)
-        y, x = int(y), int(x)
-        y = np.clip(y, 0, H - 1)                     # scalar int — row clamped to valid range
-        x = np.clip(x, 0, W - 1)                     # scalar int — col clamped to valid range
+        y, x = graph.nodes[n]['o']                   # (2,) — skeleton node position as (row, col) in downsampled space
+        # The graph was built on mask_small = mask_np[::4, ::4], so every coordinate
+        # lives in [0, H/4) × [0, W/4). Multiplying by 4 maps it back onto the
+        # full-res pixel grid — e.g. downsampled row=100 → full-res row=400.
+        # This ensures dist[], img_np[], and pixel_feats_np[] are indexed at the correct
+        # full-resolution pixel rather than a 4× smaller location.
+        y = np.clip(int(y) * 4, 0, H - 1)            # full-res row ∈ [0, H-1]
+        x = np.clip(int(x) * 4, 0, W - 1)            # full-res col ∈ [0, W-1]
 
         # ── Feature 1-2: vessel direction θ as (cos θ, sin θ) ───────────────
         # pts = ordered interior pixel path of edge n──nb; pts[0] sits next to n, pts[-1] next to nb.
@@ -376,20 +523,44 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         #   Storing as a 2-D unit vector (cos θ, sin θ) also lets ChebConv weight
         #   the horizontal (cos) and vertical (sin) components independently, giving
         #   it the power to learn orientation-sensitive vessel filters.
-        cos_vals = []        # accumulates cos(θ) per edge leaving n; len = degree(n) after loop
-        sin_vals = []        #   e.g. tip (deg=1) → len=1; junction (deg=3) → len=3
-        for nb in graph.neighbors(n):               # nb = sknw node ID of each direct neighbour
+        # ── Single neighbor loop — computes direction, curvature, and diameter
+        #    consistency in one pass instead of three, eliminating 2× redundant
+        #    graph[n][nb] dict lookups and neighbour-list iterations per node.
+        cos_vals = []              # accumulates cos(θ) per edge leaving n
+        sin_vals = []              #   e.g. tip (deg=1) → len=1; junction (deg=3) → len=3
+        kappa    = 0.0             # accumulated |sin(bend angle)| across all edges
+        diameters_along_edges = [] # radius samples from every interior path pixel at this node
+        for nb in graph.neighbors(n):               # nb = node ID of each direct neighbour
             pts = graph[n][nb]['pts']               # (L, 2) int — ordered [row,col] path of interior
                                                     #   pixels between n and nb; does NOT include n or nb
                                                     #   e.g. horizontal edge, L=5:
                                                     #   pts = [[r,1],[r,2],[r,3],[r,4],[r,5]]
-            if len(pts) >= 2:           # need ≥2 distinct pixels to form a direction vector pts[-1]−pts[0];
-                                        #   L=0 → index error;  L=1 → pts[-1] is pts[0] → dy=dx=0 → arctan2(0,0)=0 (undefined direction)
+            L = len(pts)
+            # ── direction (cos/sin) ────────────────────────────────────────
+            if L >= 2:              # need ≥2 distinct pixels to form a direction vector pts[-1]−pts[0];
+                                    #   L=0 → index error;  L=1 → pts[-1] is pts[0] → dy=dx=0 → arctan2(0,0)=0 (undefined direction)
                 dy    = float(pts[-1][0] - pts[0][0])  # scalar float — row displacement (+ = downward)
                 dx    = float(pts[-1][1] - pts[0][1])  # scalar float — col displacement (+ = rightward)
                 angle = np.arctan2(dy, dx)             # scalar float ∈ [−π, π]
                 cos_vals.append(np.cos(angle))         # circular mean: accumulate unit-vector components
                 sin_vals.append(np.sin(angle))         #   avoids ±π wrap-around of plain angle mean
+            # ── curvature κ ───────────────────────────────────────────────
+            # direction and curvature use relative pixel differences (pts[-1]-pts[0],
+            # pts[1]-pts[0], etc.) which are scale-invariant — multiplying all coords
+            # by 2 cancels in the ratio, so downsampled pts give identical results.
+            if L >= 3:
+                v1    = (pts[1]  - pts[0]).astype(np.int64)         # (2,) int64 — tangent at start
+                v2    = (pts[-1] - pts[-2]).astype(np.int64)        # (2,) int64 — tangent at end
+                cross = float(v1[0]*v2[1] - v1[1]*v2[0])            # scalar — z-component of 2D cross product
+                norm  = float(np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-8
+                kappa += abs(cross / norm)             # accumulate |sin(angle)| per edge
+            # ── diameter consistency ───────────────────────────────────────
+            # pts are in downsampled space → multiply by 4 to index dist[] which
+            # is full-res, so we sample the accurate vessel-radius value.
+            if L > 0:
+                ys_e = np.clip(pts[:, 0].astype(int) * 4, 0, H - 1)
+                xs_e = np.clip(pts[:, 1].astype(int) * 4, 0, W - 1)
+                diameters_along_edges.extend(dist[ys_e, xs_e].tolist())
         # cos_vals / sin_vals after loop examples:
         #   tip  (deg=1, down-right ↘):    cos_vals=[+0.71], sin_vals=[+0.71]
         #   junction (deg=3, right/up/dn): cos_vals=[+1.00, 0.00, 0.00], sin_vals=[0.00, −1.00, +1.00]
@@ -453,16 +624,7 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         #     sum=1.71 → kappa = 1.71/3 = 0.57   ← normalized; straight node≈0, tight elbow≈1
         #
         # High κ = sharp bend. Low κ = straight vessel.
-        kappa = 0.0                                  # scalar float — accumulated bend across all edges
-        for nb in graph.neighbors(n):
-            pts = graph[n][nb]['pts']                # (L, 2) int
-            if len(pts) >= 3:
-                v1    = pts[1]  - pts[0]             # (2,) int — tangent at start
-                v2    = pts[-1] - pts[-2]            # (2,) int — tangent at end
-                cross = float(v1[0]*v2[1] - v1[1]*v2[0])          # scalar — z-component of 2D cross product
-                norm  = float(np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-8
-                kappa += abs(cross / norm)           # accumulate |sin(angle)| per edge
-        kappa = kappa / max(graph.degree(n), 1)      # mean |sin| per edge ∈ [0,1] — divide by degree so value is comparable across tips and junctions
+        kappa = kappa / max(graph.degree(n), 1)      # mean |sin| per edge ∈ [0,1] — accumulated in the single neighbor loop above
 
         # ── Feature 7: degree ──────────────────────────────────────────────
         # Number of vessel branches at this node.
@@ -485,15 +647,7 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         # Standard deviation of vessel diameter sampled along all edges at this node.
         # Consistent diameter along a segment → real vessel (low std).
         # Sudden diameter change → false positive joining two different structures (high std).
-        diameters_along_edges = []          # collects dist values (= radii) from every interior pixel of every edge at n
-        for nb in graph.neighbors(n):
-            pts = graph[n][nb]['pts']        # (L, 2) int — interior pixel path of edge n──nb; does NOT include n or nb
-            if len(pts) > 0:
-                ys_e = np.clip(pts[:, 0].astype(int), 0, H-1)   # (L,) int — row coords of path pixels, clamped to image bounds
-                xs_e = np.clip(pts[:, 1].astype(int), 0, W-1)   # (L,) int — col coords of path pixels, clamped to image bounds
-                diameters_along_edges.extend(dist[ys_e, xs_e].tolist())
-                # dist[ys_e, xs_e]: (L,) float — radius at each path pixel (Euclidean dist to nearest background)
-                # extend appends all L radii into the flat list; after the loop it holds radii from ALL edges at n
+        # diameters_along_edges was filled (with full-res ×4 coords) in the single neighbor loop above.
         if diameters_along_edges:
             r     = np.array(diameters_along_edges)
             diam_std = float(r.std() / (r.mean() + 1e-8))   # coefficient of variation: std / mean ∈ [0, ~1]
@@ -532,8 +686,10 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
             continue
         i, j = node_idx[u], node_idx[v]             # scalar ints — integer indices
 
-        pts    = data.get('pts', np.array([]))       # (L, 2) int — pixel path along edge; empty if direct neighbour
-        length = float(len(pts)) if len(pts) > 0 else 1.0   # scalar float — path length in pixels
+        pts    = data.get('pts', np.array([]))       # (L, 2) int — pixel path in downsampled coords; empty if direct neighbour
+        # ×4: pts are in downsampled space (same reason as node positions above).
+        # Multiply pixel count by 4 to approximate the full-res path length.
+        length = float(len(pts)) * 4 if len(pts) > 0 else 4.0   # scalar float — approx full-res path length in pixels
 
         # ── Edge feature 1: normalized length ─────────────────────────────
         length_norm = length / max(H, W)             # scalar float ∈ [0,1]
@@ -543,8 +699,10 @@ def build_vessel_graph(mask_np, img_np, pixel_feats_np):
         # High mean → fluorescence signal present → real vessel.
         # Low mean  → dark region between two predicted segments → likely a false prediction.
         if len(pts) > 0:
-            ys_e = np.clip(pts[:, 0].astype(int), 0, H-1)   # (L,) int — row coords
-            xs_e = np.clip(pts[:, 1].astype(int), 0, W-1)   # (L,) int — col coords
+            # pts are in downsampled coords → multiply by 4 to index img_np which is full-res.
+            # Each downsampled pixel maps to the corresponding full-res pixel at 4× the position.
+            ys_e = np.clip(pts[:, 0].astype(int) * 4, 0, H-1)   # (L,) int — full-res row coords
+            xs_e = np.clip(pts[:, 1].astype(int) * 4, 0, W-1)   # (L,) int — full-res col coords
             intensities  = img_np[ys_e, xs_e]               # (L,) float32 — pixel intensities along path         img_np: (H, W) - float32 raw image for graph intensity features
             gap_mean     = float(intensities.mean())         # scalar float ∈ [0,1]
             # Standard deviation of brightness along the path.
@@ -958,60 +1116,117 @@ class VesselSegNet(nn.Module):
         self.fuse_proj = nn.Conv2d(32 + 64, 32, kernel_size=1)                 # (B,96,H,W)→(B,32,H,W)
         self.head      = nn.Conv2d(32, 1, kernel_size=1)                        # (B,32,H,W)→(B,1,H,W)
 
-    def forward(self, x, img_np=None, mask_coarse_np=None):
+    def forward(self, x, use_graph=True):
         """
-        x:               (B, 1, H, W)  float32 tile ∈ [0,1]
-        img_np:          (H, W)        float32 raw image for graph intensity features
-        mask_coarse_np:  (H, W)        bool    coarse mask for skeleton and graph construction
+        Standard two-pass self-feedback forward for graph-augmented segmentation.
 
-        Returns: logits (B, 1, H, W)  — pass through sigmoid for probabilities
+        Why two-pass? The graph path needs a binary skeleton/graph as input, but
+        we don't have ground truth at inference time. The standard solution is
+        self-distillation: the model produces a coarse mask in pass 1 (CNN-only)
+        and uses *its own* coarse mask in pass 2 to build the graph. This keeps
+        train and inference behaviour identical — both use the model's coarse
+        prediction as the graph source — eliminating any train/test mismatch.
+
+        Pass 1 (no_grad): CNN → coarse_logits → sigmoid → threshold → coarse_mask.
+        Pass 2 (with grad): per-sample graph constructed from coarse_mask, GAT
+            produces topology features F_graph, fused with F_pixel via 1×1 conv,
+            head produces refined logits. Loss is computed on the refined logits.
+
+        x:          (B, 1, H, W)  float32 tile ∈ [0,1]
+        use_graph:  if False, skip pass 2 → CNN-only logits (ablation / fallback).
+                    Default True.
+
+        Returns: (logits, coarse_logits)
+            logits:        (B, 1, H, W)  refined logits  (use_graph=True)  or CNN-only logits (use_graph=False)
+            coarse_logits: (B, 1, H, W)  CNN-only logits for deep-supervision loss (use_graph=True only),
+                           or None when use_graph=False.
         """
-        B, C, H, W = x.shape   # e.g. B=2, C=1, H=1300, W=1024
+        B, _, H_in, W_in = x.shape   # input tile shape, e.g. (B, 1, 1300, 1024)
 
-        # ── Encoder (frozen) — no gradients ─────────────────────────────────
-        feats   = self.encoder(x)         # [(B,256,H/4,W/4), ..., (B,256,H/32,W/32)]
+        # ── Encoder (frozen) + CNN decoder — feature extraction ─────────────
+        # F_pixel is at SAM2 resolution (1024×1024) regardless of input H_in/W_in,
+        # because the SAM2 processor rescales every tile to 1024×1024 internally.
+        feats   = self.encoder(x)
+        F_pixel = self.cnn_dec(feats)             # (B, 32, H_sam, W_sam) ≈ (B, 32, 1024, 1024)
 
-        # ── CNN path ────────────────────────────────────────────────────────
-        F_pixel = self.cnn_dec(feats)     # (B, 32, H, W) — pixel-aligned local features
-
-        # ── Graph path (runs only when coarse mask is provided) ─────────────
-        # First training pass: no coarse mask → CNN-only (logits from first pass become the mask)
-        # Subsequent passes: coarse mask from sigmoid(logits)>0.5 feeds the graph path
-        if mask_coarse_np is not None and img_np is not None:
-            try:
-                # Sample CNN pixel features at skeleton node positions
-                pf_np = F_pixel[0].permute(1, 2, 0).detach().cpu().numpy()
-                # (B,32,H,W)[0] → (32,H,W) → permute → (H,W,32) float32 numpy
-
-                graph_data = build_vessel_graph(mask_coarse_np, img_np, pf_np)
-                # dict with node_pos(N,2), node_feats(N,39), edge_index(2,E), edge_feats(E,4)
-                # or None if graph is degenerate
-
-                if graph_data is not None:
-                    nf  = torch.from_numpy(graph_data['node_feats']).to(x.device)  # (N, 39) float32
-                    ei  = torch.from_numpy(graph_data['edge_index']).to(x.device)  # (2, E)  int64
-                    np_ = torch.from_numpy(graph_data['node_pos']).to(x.device)    # (N, 2)  float32
-
-                    node_emb = self.graph_net(nf, ei)                  # (N, 41) → (N, 64) topology embeddings
-                    F_graph  = scatter_to_pixels(np_, node_emb, H, W, x.device)   # (1, 64, H, W)
-                    F_graph  = F_graph.expand(B, -1, -1, -1)           # (B, 64, H, W) — broadcast to batch
-
-                    # Fuse: concatenate CNN local features + graph topology features
-                    F_fused  = torch.cat([F_pixel, F_graph], dim=1)    # (B, 32+64, H, W) = (B, 96, H, W)
-                    F_fused  = self.fuse_proj(F_fused)                 # (B, 96, H, W) → (B, 32, H, W)
-                else:
-                    F_fused = F_pixel   # degenerate graph → CNN-only fallback
-            except Exception:
-                F_fused = F_pixel       # any graph error → silent CNN-only fallback (never crashes training)
+        if not use_graph:
+            # CNN-only path (used for ablation studies or when graph is disabled).
+            coarse_logits = None
+            logits = self.head(F_pixel)
         else:
-            F_fused = F_pixel           # no mask provided → CNN-only forward pass
+            # ── Pass 1: coarse logits for deep supervision + mask for graph ──
+            # coarse_logits retains gradient so deep-supervision loss trains the
+            # CNN head directly. The mask used for graph construction is detached
+            # (.detach() + .numpy()) — graph construction is non-differentiable,
+            # so no gradient flows through it regardless.
+            coarse_logits     = self.head(F_pixel)                   # (B, 1, H_sam, W_sam) — gradient ON
+            mask_coarse_batch = (torch.sigmoid(coarse_logits.detach()) > 0.5).cpu().numpy()  # (B, 1, H_sam, W_sam)
 
-        logits = self.head(F_fused)     # (B, 32, 1024, 1024) → (B, 1, 1024, 1024) raw logits
+            # Resize input image to F_pixel's resolution once for the whole batch.
+            # build_vessel_graph uses raw image intensities for some node features,
+            # so img and mask must be at the same scale as F_pixel.
+            H_sam, W_sam = F_pixel.shape[-2:]
+            if (H_in, W_in) != (H_sam, W_sam):
+                x_sam = F.interpolate(x, size=(H_sam, W_sam),
+                                      mode='bilinear', align_corners=False)
+            else:
+                x_sam = x
 
-        # SAM2 processor internally rescales every tile to 1024×1024, so logits are always
-        # 1024×1024 regardless of the original tile size (TILE_H=1300, TILE_W=1024).
-        # Resize back to the original tile dimensions so logits align with the target mask.
-        if logits.shape[-2:] != (H, W):
-            logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+            # ── Pass 2: per-sample graph features ─────────────────────────
+            # Built one graph per sample (correct for any batch size). Earlier
+            # versions used sample 0's graph for the whole batch — that was a
+            # bug at B>1.
+            #
+            # All arrays are forced contiguous via np.ascontiguousarray BEFORE
+            # passing to skeletonize/sknw. Slicing and .astype() can yield
+            # non-contiguous views in some numpy versions, and the C
+            # extensions in skimage/sknw assume contiguous C-order memory —
+            # passing a view triggers heap corruption (`malloc(): invalid next
+            # size`) at unpredictable points later in the run.
+            F_graph_list = []
+            for b in range(B):
+                try:
+                    mask_b = np.ascontiguousarray(mask_coarse_batch[b, 0]).astype(bool, copy=True)
+                    img_b  = np.ascontiguousarray(
+                        x_sam[b, 0].detach().cpu().numpy().astype(np.float32, copy=True))
+                    pf_b   = np.ascontiguousarray(
+                        F_pixel[b].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32, copy=True))
 
-        return logits                   # (B, 1, H, W) float32 — passed to VesselLoss or sigmoid
+                    graph_data = build_vessel_graph(mask_b, img_b, pf_b)
+                    if graph_data is None or len(graph_data.get('node_pos', [])) < 2:
+                        raise ValueError('degenerate graph')
+
+                    nf      = torch.from_numpy(graph_data['node_feats']).to(x.device)  # (N, 39)
+                    ei      = torch.from_numpy(graph_data['edge_index']).to(x.device)  # (2, E)
+                    np_pos  = torch.from_numpy(graph_data['node_pos']).to(x.device)    # (N, 2)
+
+                    node_emb = self.graph_net(nf, ei)                            # (N, 64) topology embed
+                    fg       = scatter_to_pixels(np_pos, node_emb,
+                                                 H_sam, W_sam, x.device)         # (1, 64, H_sam, W_sam)
+                    F_graph_list.append(fg[0])                                   # (64, H_sam, W_sam)
+                except Exception:
+                    # Degenerate graph (e.g. coarse mask mostly empty in early
+                    # training, or a tile with no vessels). Use zero topology
+                    # features so this sample falls back to CNN-only behaviour.
+                    F_graph_list.append(torch.zeros(64, H_sam, W_sam, device=x.device))
+
+            F_graph = torch.stack(F_graph_list, dim=0)                # (B, 64, H_sam, W_sam)
+            F_fused = torch.cat([F_pixel, F_graph], dim=1)            # (B, 96, H_sam, W_sam)
+            F_fused = self.fuse_proj(F_fused)                          # (B, 32, H_sam, W_sam)
+            logits  = self.head(F_fused)                               # (B, 1,  H_sam, W_sam)
+
+        # SAM2 always works at 1024×1024 internally, so logits come out at that
+        # resolution. Resize both outputs back to the original tile shape so
+        # loss / mask alignment is correct.
+        if logits.shape[-2:] != (H_in, W_in):
+            logits = F.interpolate(logits, size=(H_in, W_in),
+                                   mode='bilinear', align_corners=False)
+        # coarse_logits.shape[-2:] is the SAM2-internal (H_sam, W_sam) = (1024, 1024).
+        # (H_in, W_in) is the original input tile resolution, e.g. (1300, 1024).
+        # The check fails (and resize is skipped) only when the input was already 1024×1024.
+        # Skip entirely when coarse_logits is None (use_graph=False path).
+        if coarse_logits is not None and coarse_logits.shape[-2:] != (H_in, W_in):
+            coarse_logits = F.interpolate(coarse_logits, size=(H_in, W_in),
+                                          mode='bilinear', align_corners=False)
+
+        return logits, coarse_logits

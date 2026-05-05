@@ -17,6 +17,7 @@ module load anaconda3/2024.06
 
 source activate pytorch_env
 export HF_HOME=/scratch/$USER/.cache/huggingface
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd /home/$USER/vessel_seg
 

@@ -127,32 +127,185 @@ def cldice_loss(pred_prob, target, weight=None, eps=1e-6):
     return 1.0 - 2.0 * (t_prec * t_sens) / (t_prec + t_sens + eps)  # scalar
 
 
+# ── Hard-negative mining BCE ───────────────────────────────────────────────────
+
+def bce_loss_hard_neg(pred, target, weight=None, hard_neg_factor=2.0):
+    """
+    BCE with hard-negative mining: increases the loss weight on background pixels
+    where the model is confidently predicting "vessel" (these are the mistakes
+    that drive over-prediction / FP coverage in low-intensity regions).
+
+    Procedure:
+      1. Compute per-pixel sigmoid probabilities (no_grad — used only for weighting).
+      2. For each background pixel (target=0), the "wrongness" = sigmoid(logit)
+         — high means the model is confidently wrong.
+      3. Boost that pixel's BCE weight by (1 + hard_neg_factor * wrongness),
+         so a pixel the model is 100% sure is vessel (but isn't) contributes
+         (1 + hard_neg_factor)× its normal weight to the loss.
+      4. Multiply with the existing Hanning gate so tile-edge pixels still
+         get downweighted.
+
+    pred:            (B, 1, H, W)  raw logits (NOT sigmoided)
+    target:          (B, 1, H, W)  binary float mask
+    weight:          (B, 1, H, W)  Hanning gate (or None)
+    hard_neg_factor: scalar — peak boost for the most-wrong background pixel.
+                     factor=0 → standard BCE. factor=2 → up to 3× weight.
+    """
+    # reduction='none' → keeps per-pixel loss so we can apply the weight maps.
+    loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')  # (B, 1, H, W)
+
+    # Compute hard-negative weight (no gradient — it's just a weighting signal).
+    with torch.no_grad():
+        prob      = torch.sigmoid(pred)            # (B, 1, H, W) ∈ [0, 1]
+        bg        = (target < 0.5).float()         # 1 where background, 0 elsewhere
+        wrongness = prob * bg                      # high only where model says "vessel" but truth says "no"
+        hn_w      = 1.0 + hard_neg_factor * wrongness  # ∈ [1, 1 + factor]
+
+    if weight is not None:
+        # Combined weight: Hanning × hard-negative boost
+        w_total = weight * hn_w
+        return (loss * w_total).sum() / (w_total.sum() + 1e-8)
+
+    return (loss * hn_w).mean()
+
+
+# ── Pixel prototype contrastive loss ───────────────────────────────────────────
+
+def prototype_contrastive_loss(feats, target, n_samples=256, temp=0.1):
+    """
+    Prototype-based contrastive loss on decoder features.
+
+    Idea: vessel-pixel features should cluster around a "vessel prototype" and be
+    far from a "background prototype" — and vice versa. Trains the decoder to
+    produce features that linearly separate vessel vs background, which directly
+    helps in regions where intensity alone is ambiguous (e.g. low-intensity
+    background that texturally resembles a vessel).
+
+    Procedure (per batch sample):
+      1. L2-normalize all pixel features (so similarity = dot product = cosine).
+      2. Sample up to `n_samples` vessel pixels and `n_samples` background pixels.
+      3. Compute prototypes by averaging the sampled features:
+           v_proto  = mean(vessel feats)        — what a "true vessel" looks like
+           b_proto  = mean(background feats)    — what "true background" looks like
+      4. For each vessel sample, classify it against {v_proto, b_proto} using
+         cross-entropy with target=v_proto. Same for background samples with
+         target=b_proto. The temperature `temp` controls how sharp the
+         classification is (lower = sharper, harder).
+      5. Average the two cross-entropy terms.
+
+    feats:     (B, C, H, W)  decoder features (e.g. F_fused, 32 channels)
+    target:    (B, 1, H, W)  binary mask
+    n_samples: int — pixels sampled per class per batch element (caps memory)
+    temp:      float — InfoNCE temperature
+    Returns:   scalar loss
+    """
+    B, C, Hf, Wf = feats.shape
+    feats_flat   = F.normalize(feats.reshape(B, C, -1), dim=1)   # (B, C, Hf*Wf) — unit-norm features
+
+    # Features come from inside the model (head input) and live at SAM2's
+    # internal 1024×1024 resolution, while target is at the original tile
+    # resolution (e.g. 1300×1024). Downsample target to match feats so pixel
+    # indices are valid; nearest-neighbour preserves the binary 0/1 labels.
+    if target.shape[-2:] != (Hf, Wf):
+        target = F.interpolate(target, size=(Hf, Wf), mode='nearest')
+    target_flat = target.reshape(B, -1)                           # (B, Hf*Wf) ∈ {0, 1}
+
+    losses = []
+    for b in range(B):
+        pos_idx = torch.where(target_flat[b] > 0.5)[0]            # vessel pixel indices
+        neg_idx = torch.where(target_flat[b] < 0.5)[0]            # background pixel indices
+        if len(pos_idx) < 2 or len(neg_idx) < 2:
+            continue                                              # skip degenerate tiles
+
+        # Random subsample to bound memory (full image has up to ~1.3M pixels).
+        n_pos   = min(n_samples, len(pos_idx))
+        n_neg   = min(n_samples, len(neg_idx))
+        pos_idx = pos_idx[torch.randperm(len(pos_idx), device=feats.device)[:n_pos]]
+        neg_idx = neg_idx[torch.randperm(len(neg_idx), device=feats.device)[:n_neg]]
+
+        pos = feats_flat[b, :, pos_idx]                           # (C, n_pos)
+        neg = feats_flat[b, :, neg_idx]                           # (C, n_neg)
+
+        # Class prototypes (re-normalised after averaging — averaging ≠ unit-norm).
+        v_proto = F.normalize(pos.mean(dim=1, keepdim=True), dim=0)   # (C, 1)
+        b_proto = F.normalize(neg.mean(dim=1, keepdim=True), dim=0)   # (C, 1)
+
+        # For positives: similarity to v_proto should beat similarity to b_proto.
+        # Logits shape (n_pos, 2), target = 0 (= v_proto column).
+        sim_pos_v = (pos.T @ v_proto).squeeze(-1) / temp          # (n_pos,)
+        sim_pos_b = (pos.T @ b_proto).squeeze(-1) / temp          # (n_pos,)
+        loss_pos  = F.cross_entropy(
+            torch.stack([sim_pos_v, sim_pos_b], dim=1),
+            torch.zeros(n_pos, dtype=torch.long, device=feats.device),
+        )
+
+        # For negatives: similarity to b_proto should beat similarity to v_proto.
+        # Same 2-class CE but target = 1 (= b_proto column).
+        sim_neg_v = (neg.T @ v_proto).squeeze(-1) / temp
+        sim_neg_b = (neg.T @ b_proto).squeeze(-1) / temp
+        loss_neg  = F.cross_entropy(
+            torch.stack([sim_neg_v, sim_neg_b], dim=1),
+            torch.ones(n_neg, dtype=torch.long, device=feats.device),
+        )
+
+        losses.append((loss_pos + loss_neg) / 2)
+
+    if not losses:
+        # All tiles in the batch were degenerate (rare); return zero with grad.
+        return feats.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
 # ── Combined Gated Loss ────────────────────────────────────────────────────────
 
 class VesselLoss(nn.Module):
     """
-    L = Dice(pred, gt, W) + BCE(logits, gt, W) + λ·clDice(pred, gt, W)
-    All three gated by Hanning weight map W.
-    λ = 0.5 (clDice weight)
-    """
-    def __init__(self, lambda_cldice=0.5):
-        super().__init__()
-        self.lam = lambda_cldice
+    L = Dice(pred, gt, W) + BCE_hard_neg(logits, gt, W) + λ_cl·clDice(pred, gt, W)
+        + λ_ct·prototype_contrastive(feats, gt)        (when feats provided)
 
-    def forward(self, logits, target, hann_weight):
+    All three pixel losses gated by Hanning weight map W. BCE additionally uses
+    hard-negative mining to fight over-prediction in low-intensity background.
+    Prototype contrastive on decoder features is optional — pass `feats=None` to
+    disable (e.g. during inference).
+
+    Hyperparameters:
+      lambda_cldice    weight on clDice (topology-aware Dice)        default 0.5
+      lambda_contrast  weight on prototype contrastive               default 0.1
+      hard_neg_factor  peak boost for confidently-wrong bg pixels    default 2.0
+    """
+    def __init__(self, lambda_cldice=0.5, lambda_contrast=0.1, hard_neg_factor=2.0):
+        super().__init__()
+        self.lam            = lambda_cldice
+        self.lam_ct         = lambda_contrast
+        self.hard_neg_factor = hard_neg_factor
+
+    def forward(self, logits, target, hann_weight, feats=None):
         """
-        logits:      (B, 1, H, W)  raw decoder output
-        target:      (B, 1, H, W)  binary float mask
-        hann_weight: (B, 1, H, W)  Hanning gate
+        logits:      (B, 1, H, W)   raw decoder output
+        target:      (B, 1, H, W)   binary float mask
+        hann_weight: (B, 1, H, W)   Hanning gate
+        feats:       (B, C, H, W)   optional decoder features for contrastive loss
         """
         pred = torch.sigmoid(logits)
 
-        l_dice  = dice_loss(pred,   target, hann_weight)
-        l_bce   = bce_loss(logits,  target, hann_weight)
-        l_cl    = cldice_loss(pred, target, hann_weight)
+        l_dice = dice_loss(pred,   target, hann_weight)
+        l_bce  = bce_loss_hard_neg(logits, target, hann_weight,
+                                   hard_neg_factor=self.hard_neg_factor)
+        l_cl   = cldice_loss(pred, target, hann_weight)
 
-        return l_dice + l_bce + self.lam * l_cl, {
-            'dice':   l_dice.item(),
-            'bce':    l_bce.item(),
-            'cldice': l_cl.item(),
+        # Contrastive only contributes when features are passed in — keeps
+        # inference / val paths free of the extra compute.
+        if feats is not None and self.lam_ct > 0:
+            l_ct = prototype_contrastive_loss(feats, target)
+            total = l_dice + l_bce + self.lam * l_cl + self.lam_ct * l_ct
+            l_ct_val = l_ct.item()
+        else:
+            total = l_dice + l_bce + self.lam * l_cl
+            l_ct_val = 0.0
+
+        return total, {
+            'dice':       l_dice.item(),
+            'bce':        l_bce.item(),
+            'cldice':     l_cl.item(),
+            'contrast':   l_ct_val,
         }

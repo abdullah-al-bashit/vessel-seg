@@ -7,8 +7,9 @@ import torch
 from tifffile import imread, imwrite
 from tqdm import tqdm
 
-from dataset  import normalize, tile_image, stitch_tiles, load_pairs
-from model    import VesselSegNet
+from dataset     import normalize, tile_image, stitch_tiles, load_pairs
+from model       import VesselSegNet
+from postprocess import postprocess           # rule-based mask cleanup
 import wandb
 
 
@@ -38,7 +39,7 @@ def predict_image(model, img_path, device):
                     img_tile.astype(np.float32) / 255.0
                 ).unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, H, W)
 
-            logits = model(t)
+            logits, _ = model(t, use_graph=True)   # full graph-refined path; coarse_logits unused at inference
             prob   = torch.sigmoid(logits).squeeze().cpu().numpy()  # (H, W)
             tile_probs.append(prob)
             tile_xs.append(x_off)
@@ -98,45 +99,99 @@ def main(args):
         fname = os.path.basename(img_path).replace('.tif', '_pred.tif')
         out_path = os.path.join(args.out_dir, fname)
 
-        mask = predict_image(model, img_path, device)
+        mask    = predict_image(model, img_path, device)        # raw model output
+        mask_pp = postprocess(mask)                              # cleaned: small blobs removed, holes filled, gaps closed
 
-        # Save as uint8 binary (0 / 255) to match your existing mask format
-        imwrite(out_path, (mask.astype(np.uint8) * 255))
+        # Save the postprocessed mask (cleaner, what you'd actually use downstream).
+        imwrite(out_path, (mask_pp.astype(np.uint8) * 255))
         print(f'  saved → {out_path}')
 
-        # Log original image and predicted mask side-by-side so you can browse
-        # all results in the W&B Media panel without opening individual .tif files.
-        # Caption includes the split label ("test" / "trainval") from data_splits.json
-        # so you can tell at a glance which images were held out vs used in training.
+        # W&B Media panels per image: originals, prediction, gt, tp, fp, fn,
+        # combined. Each panel has its own step slider so you can isolate one
+        # error type at a time, or compare predictions vs ground truth, or see
+        # everything together. Caption tags from data_splits.json show whether
+        # the image was test / trainval / no-GT.
         img_raw = imread(img_path)
         fname   = os.path.basename(img_path)
-        label   = splits_info.get(fname, "unknown")
+        # Label hierarchy: split assignment from training, or "no_gt" if the
+        # image has no matching mask, or "extra" otherwise.
+        if fname in splits_info:
+            label = splits_info[fname]                # "test" / "trainval"
+        elif img_path not in img_to_mask:
+            label = "no_gt"
+        else:
+            label = "extra"
+
+        # Percentile (1–99%) contrast stretch — outlier-robust so vessel
+        # structures stay visible. Plain min-max compresses the histogram when
+        # a few extreme pixels sit at the ends of the range.
+        lo, hi   = np.percentile(img_raw, (1, 99))
+        img_norm = np.clip((img_raw.astype(np.float32) - lo) / (hi - lo + 1e-8), 0, 1)
+        img_u8   = (img_norm * 255).astype(np.uint8)
+        img_rgb  = np.stack([img_u8] * 3, axis=-1)            # (H, W, 3) grayscale → RGB
+
+        # Color palette (high contrast on dark microscopy):
+        #   red   = "model predicted vessel" (prediction, FP)
+        #   green = "actual vessel"          (ground truth, TP)
+        #   cyan  = "missed vessel"          (FN)
+        RED, GREEN, CYAN = (
+            np.array([255,   0,   0]),
+            np.array([  0, 220,   0]),
+            np.array([  0, 200, 255]),
+        )
+        alpha = 0.6
+
+        def overlay(base, m, color):
+            """Blend `color` onto `base` wherever boolean mask `m` is True."""
+            out = base.copy()
+            out[m] = (alpha * color + (1 - alpha) * out[m]).astype(np.uint8)
+            return out
+
+        def make_combined(m, gt_):
+            """Build one TP/FP/FN composite view for a given mask vs ground truth."""
+            tp = m  &  gt_
+            fp = m  & ~gt_
+            fn = ~m &  gt_
+            c  = img_rgb.copy()
+            c[tp] = (alpha * GREEN + (1 - alpha) * c[tp]).astype(np.uint8)
+            c[fp] = (alpha * RED   + (1 - alpha) * c[fp]).astype(np.uint8)
+            c[fn] = (alpha * CYAN  + (1 - alpha) * c[fn]).astype(np.uint8)
+            return c
+
+        cap = f"[{label}] {fname}"
         log_payload = {
-            "predictions": wandb.Image(
-                img_raw,
-                masks={"prediction": {"mask_data": mask.astype(np.uint8)}},
-                caption=f"[{label}] {fname}",
-            )
+            "originals":     wandb.Image(img_rgb, caption=cap),
+            "prediction":    wandb.Image(overlay(img_rgb, mask,    RED),
+                                         caption=f"{cap}  |  raw prediction"),
+            "prediction_pp": wandb.Image(overlay(img_rgb, mask_pp, RED),
+                                         caption=f"{cap}  |  postprocessed prediction"),
         }
 
-        # If ground truth is available, compute a TP/FP/FN error map and log it
-        # alongside the prediction. Uses W&B multi-class mask: each class gets a
-        # different color in the viewer (TP=green, FP=red, FN=yellow by convention).
+        # If GT mask exists, log isolated TP/FP/FN panels + combined views, both
+        # for the raw mask and the postprocessed mask, so you can directly compare.
         gt_path = img_to_mask.get(img_path)
         if gt_path:
             gt = imread(gt_path) > 0                          # (H, W) bool ground truth
-            err_map = np.zeros_like(mask, dtype=np.uint8)     # 0=background (TN)
-            err_map[mask  &  gt] = 1                          # TP — predicted vessel where it is one
-            err_map[mask  & ~gt] = 2                          # FP — predicted vessel where there isn't one
-            err_map[~mask &  gt] = 3                          # FN — missed a real vessel
-            log_payload["errors"] = wandb.Image(
-                img_raw,
-                masks={"errors": {
-                    "mask_data":    err_map,
-                    "class_labels": {0: "background", 1: "TP", 2: "FP", 3: "FN"},
-                }},
-                caption=f"[{label}] {fname}",
-            )
+            log_payload.update({
+                "gt":          wandb.Image(overlay(img_rgb, gt, GREEN),
+                                           caption=f"{cap}  |  green = ground-truth vessel"),
+                "tp":          wandb.Image(overlay(img_rgb, mask    &  gt, GREEN),
+                                           caption=f"{cap}  |  TP (raw)"),
+                "fp":          wandb.Image(overlay(img_rgb, mask    & ~gt, RED),
+                                           caption=f"{cap}  |  FP (raw)"),
+                "fn":          wandb.Image(overlay(img_rgb, ~mask   &  gt, CYAN),
+                                           caption=f"{cap}  |  FN (raw)"),
+                "combined":    wandb.Image(make_combined(mask, gt),
+                                           caption=f"{cap}  |  raw  |  green=TP  red=FP  cyan=FN"),
+                "tp_pp":       wandb.Image(overlay(img_rgb, mask_pp &  gt, GREEN),
+                                           caption=f"{cap}  |  TP (postprocessed)"),
+                "fp_pp":       wandb.Image(overlay(img_rgb, mask_pp & ~gt, RED),
+                                           caption=f"{cap}  |  FP (postprocessed)"),
+                "fn_pp":       wandb.Image(overlay(img_rgb, ~mask_pp &  gt, CYAN),
+                                           caption=f"{cap}  |  FN (postprocessed)"),
+                "combined_pp": wandb.Image(make_combined(mask_pp, gt),
+                                           caption=f"{cap}  |  postprocessed  |  green=TP  red=FP  cyan=FN"),
+            })
 
         wandb.log(log_payload)
 
