@@ -22,12 +22,14 @@ import wandb
 SEED          = 42   # single source of truth for all random seeds throughout training
 N_FOLDS       = 5    # number of cross-validation folds
 TEST_SPLIT    = 0.2  # fraction of pairs held out as final test set
-PATIENCE      = 30   # early stopping: epochs without val loss improvement before stopping
-LAMBDA_CLDICE = 0.5  # weight of clDice term in VesselLoss (total = soft_dice + bce + λ·cldice)
+PATIENCE        = 30   # early stopping: epochs without val loss improvement before stopping
+LAMBDA_CLDICE   = 1.0  # weight of clDice — increased from 0.5; best learning signal
+LAMBDA_BOUNDARY = 0.5  # weight of sharpness boundary loss — penalises predictions crossing focus edges
 LAMBDA_COARSE = 0.4  # weight of deep-supervision loss on the pass-1 coarse mask (training only)
                      # adds 0.4 × VesselLoss(coarse_logits, gt) so the CNN head learns to produce
                      # clean vessel masks before the graph path refines them
-NUM_WORKERS   = 4    # DataLoader worker processes for parallel data loading
+NUM_WORKERS        = 8    # DataLoader worker processes — matches --cpus-per-task=8
+GRAPH_WARMUP_EPOCHS = 10  # train CNN-only for first N epochs; graph path enabled after
 
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
@@ -44,42 +46,38 @@ def set_seed(seed=SEED):
 # ── One epoch ─────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
-              feat_capture=None):
+              feat_capture=None, use_graph=None):
     """
     feat_capture: optional dict populated by a forward hook (see main()) that
                   holds the decoder features under key 'feats'. Passed to
                   criterion only during training so the contrastive loss can
                   use them. Val/test pass None to skip that compute.
     """
+    if use_graph is None:
+        use_graph = train  # default: graph during training, disabled during val
     model.train(train)
     total_loss  = 0.0
-    total_parts = {'dice': 0.0, 'bce': 0.0, 'cldice': 0.0, 'contrast': 0.0, 'coarse': 0.0}
+    total_parts = {'dice': 0.0, 'bce': 0.0, 'cldice': 0.0, 'boundary': 0.0, 'contrast': 0.0, 'coarse': 0.0}
 
     use_amp = device.type == 'cuda'
     # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for img, msk, hann in tqdm(loader):  # batch loop — each iteration yields (B, 1, H, W) tensors
-            img  = img.to(device)
-            msk  = msk.to(device)
-            hann = hann.to(device)
+        for img, msk, hann, sharp, grad in tqdm(loader):
+            img   = img.to(device)
+            msk   = msk.to(device)
+            hann  = hann.to(device)
+            sharp = sharp.to(device)
+            grad  = grad.to(device)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                # Training: use_graph=True so pass 1 produces coarse_logits
-                # (deep supervision) and pass 2 refines with graph features.
-                # Val/test: use_graph=False — skip expensive graph construction;
-                # coarse_logits is None so no coarse loss is added below.
-                logits, coarse_logits = model(img, use_graph=train)
+                logits, coarse_logits = model(img, use_graph=use_graph, sharpness=sharp, grad_mag=grad)
                 # Pass captured features to criterion only during training; val
                 # / test gets feats=None so contrastive is skipped.
                 feats  = feat_capture.get('feats') if (train and feat_capture is not None) else None
-                loss, loss_dict = criterion(logits, msk, hann, feats=feats)
-                # Deep supervision: add a weighted VesselLoss on the CNN-only
-                # pass-1 coarse logits so the CNN head learns to produce clean
-                # masks independently of the graph refinement. Only during
-                # training (coarse_logits is None on the val/test path).
+                loss, loss_dict = criterion(logits, msk, hann, sharpness=sharp, feats=feats)
                 if train and coarse_logits is not None:
-                    loss_coarse, _ = criterion(coarse_logits, msk, hann)
+                    loss_coarse, _ = criterion(coarse_logits, msk, hann, sharpness=sharp)
                     loss = loss + LAMBDA_COARSE * loss_coarse
                     loss_dict['coarse'] = loss_coarse.item()
                 else:
@@ -138,7 +136,8 @@ def main(args):
             "n_folds":        N_FOLDS,
             "test_split":     TEST_SPLIT,
             "patience":       PATIENCE,
-            "lambda_cldice":  LAMBDA_CLDICE,
+            "lambda_cldice":   LAMBDA_CLDICE,
+            "lambda_boundary": LAMBDA_BOUNDARY,
             "epochs":         args.epochs,
             "batch_size":     args.batch_size,
             "lr":             args.lr,
@@ -203,15 +202,13 @@ def main(args):
 
         model     = VesselSegNet().to(device)
 
-        # Forward hook on the prediction head — captures the fused decoder
-        # features (the input to `head`, i.e. F_fused of shape (B, 32, H, W))
-        # without modifying VesselSegNet.forward. The contrastive loss in
-        # VesselLoss uses these features; they're cleared each batch.
+        # Forward hook registered before compile so it fires on the underlying module.
         captured = {}
         def _capture_features(_module, inputs, _output):
             captured['feats'] = inputs[0]
         feat_hook = model.head.register_forward_hook(_capture_features)  # removed at end of fold
-        criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE)
+
+        criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE, lambda_boundary=LAMBDA_BOUNDARY)
         scaler    = GradScaler() if device.type == 'cuda' else None
 
         # Only train decoder + graph net — encoder is frozen inside model
@@ -226,10 +223,15 @@ def main(args):
         for epoch in range(1, args.epochs + 1):
             train_ds.seed = SEED + epoch  # vary augmentations each epoch
 
+            # Graph path is expensive (skeletonize + GNN per batch); skip it for the first
+            # GRAPH_WARMUP_EPOCHS so the CNN head converges before graph refinement kicks in.
+            use_graph = (epoch > GRAPH_WARMUP_EPOCHS)
+
             # Wall-clock per-phase timing — used for accurate runtime estimation
             t_train_start = time.perf_counter()
             tr_loss, tr_parts = run_epoch(model, train_loader, criterion,
                                           optimizer, scaler, device, train=True,
+                                          use_graph=use_graph,
                                           feat_capture=captured)   # contrastive loss uses these
             t_train = time.perf_counter() - t_train_start
 
@@ -255,8 +257,9 @@ def main(args):
                 f"fold{fold+1}/train_dice":      tr_parts["dice"],
                 f"fold{fold+1}/train_bce":       tr_parts["bce"],
                 f"fold{fold+1}/train_cldice":    tr_parts["cldice"],
-                f"fold{fold+1}/train_contrast":  tr_parts["contrast"],   # 0 if contrastive disabled
-                f"fold{fold+1}/train_coarse":    tr_parts["coarse"],     # deep-supervision pass-1 loss
+                f"fold{fold+1}/train_boundary":  tr_parts["boundary"],
+                f"fold{fold+1}/train_contrast":  tr_parts["contrast"],
+                f"fold{fold+1}/train_coarse":    tr_parts["coarse"],
                 f"fold{fold+1}/val_loss":        va_loss,
                 f"fold{fold+1}/val_dice":        va_parts["dice"],
                 f"fold{fold+1}/val_bce":         va_parts["bce"],
@@ -307,7 +310,7 @@ def main(args):
     model = VesselSegNet().to(device)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
                                      map_location=device))
-    criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE)
+    criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE, lambda_boundary=LAMBDA_BOUNDARY)
 
     te_loss, te_parts = run_epoch(model, test_loader, criterion,
                                    None, None, device, train=False)

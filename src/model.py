@@ -83,9 +83,12 @@ class SAM2Encoder(nn.Module):
         """
         B = x.shape[0]   # scalar int — batch size
 
-        # Processor expects PIL images — convert 1-channel tensor to 3-channel PIL
+        # Processor expects PIL images — convert to 3-channel PIL.
+        # x may be (B,1,H,W) grayscale or (B,3,H,W) with sharpness as 3rd channel.
         pil_images = [
-            to_pil_image(x[i].repeat(3, 1, 1).clamp(0, 1).cpu())   # (1,H,W) → (3,H,W) → PIL RGB
+            to_pil_image(
+                (x[i] if x.shape[1] == 3 else x[i].repeat(3, 1, 1)).clamp(0, 1).cpu()
+            )
             for i in range(B)
         ]
         inputs = self.processor(
@@ -1116,7 +1119,7 @@ class VesselSegNet(nn.Module):
         self.fuse_proj = nn.Conv2d(32 + 64, 32, kernel_size=1)                 # (B,96,H,W)→(B,32,H,W)
         self.head      = nn.Conv2d(32, 1, kernel_size=1)                        # (B,32,H,W)→(B,1,H,W)
 
-    def forward(self, x, use_graph=True):
+    def forward(self, x, use_graph=True, sharpness=None, grad_mag=None):
         """
         Standard two-pass self-feedback forward for graph-augmented segmentation.
 
@@ -1144,9 +1147,14 @@ class VesselSegNet(nn.Module):
         B, _, H_in, W_in = x.shape   # input tile shape, e.g. (B, 1, 1300, 1024)
 
         # ── Encoder (frozen) + CNN decoder — feature extraction ─────────────
-        # F_pixel is at SAM2 resolution (1024×1024) regardless of input H_in/W_in,
-        # because the SAM2 processor rescales every tile to 1024×1024 internally.
-        feats   = self.encoder(x)
+        # 3-channel input to SAM2:
+        #   ch0 = grayscale, ch1 = gradient magnitude (vessel edges), ch2 = sharpness (focus)
+        # Without both maps, falls back to repeating grayscale 3×.
+        if sharpness is not None and grad_mag is not None:
+            x_enc = torch.cat([x, grad_mag, sharpness], dim=1)
+        else:
+            x_enc = x
+        feats   = self.encoder(x_enc)
         F_pixel = self.cnn_dec(feats)             # (B, 32, H_sam, W_sam) ≈ (B, 32, 1024, 1024)
 
         if not use_graph:

@@ -256,35 +256,87 @@ def prototype_contrastive_loss(feats, target, n_samples=256, temp=0.1):
     return torch.stack(losses).mean()
 
 
+# ── Sharpness boundary loss ────────────────────────────────────────────────────
+
+def sharpness_boundary_loss(logits, sharpness):
+    """
+    Penalise vessel predictions that cross sharp→blurry focus boundaries.
+
+    Biology: real vessels don't straddle the focal plane boundary — if a vessel
+    is in focus it stays in focus along its length. A prediction that is high in
+    a sharp region AND bleeds into an adjacent blurry region is almost always a
+    false positive artefact, not a real vessel continuation.
+
+    Mechanism:
+      1. Compute |∇sharpness| — peaks exactly at the sharp/blurry transition.
+      2. Treat the boundary as a spatial weight map.
+      3. Apply BCE(pred, 0) * boundary_weight → any vessel prediction that sits
+         on a focus boundary is penalised, regardless of what GT says.
+
+    logits:     (B, 1, H, W)  raw logits (before sigmoid) — safe for AMP autocast
+    sharpness:  (B, 1, H, W)  per-pixel sharpness ∈ [0, 1]
+    Returns:    scalar loss
+    """
+    # ── Sharpness gradient via finite differences ──────────────────────────────
+    # dy: vertical gradient — how fast sharpness changes row-to-row.
+    #     Computed as: s[row+1] - s[row] for all rows except the last.
+    #     Shape (B,1,H-1,W); padded to (B,1,H,W) by repeating the last row.
+    #     A large |dy| at row r means rows r and r+1 are on opposite sides of
+    #     the focus boundary (one sharp, one blurry).
+    dy = sharpness[:, :, 1:, :] - sharpness[:, :, :-1, :]   # (B,1,H-1,W)
+    dy = F.pad(dy, (0, 0, 0, 1))                              # pad bottom row → (B,1,H,W)
+
+    # dx: horizontal gradient — how fast sharpness changes column-to-column.
+    #     Computed as: s[col+1] - s[col] for all cols except the last.
+    #     Shape (B,1,H,W-1); padded to (B,1,H,W) by repeating the last column.
+    dx = sharpness[:, :, :, 1:] - sharpness[:, :, :, :-1]   # (B,1,H,W-1)
+    dx = F.pad(dx, (0, 1, 0, 0))                              # pad right col  → (B,1,H,W)
+
+    # Gradient magnitude = Euclidean length of (dx, dy) at each pixel.
+    # This is the "edge strength" of the sharpness map — 0 in flat regions
+    # (uniformly sharp or uniformly blurry) and high at transitions.
+    boundary = (dy ** 2 + dx ** 2).sqrt()                     # (B,1,H,W)
+
+    # Normalise per-sample so scale is consistent regardless of tile content.
+    boundary = boundary / (boundary.flatten(1).max(dim=1).values[:, None, None, None] + 1e-8)
+
+    # BCE_with_logits(logits, 0) = log(1 + exp(logits)): penalises any
+    # positive prediction. AMP-safe (unlike F.binary_cross_entropy which
+    # requires float32). Multiplied by boundary so only predictions AT
+    # focus transitions are penalised — flat sharp/blurry regions get ~0.
+    return (F.binary_cross_entropy_with_logits(logits, torch.zeros_like(logits), reduction='none')
+            * boundary).mean()
+
+
 # ── Combined Gated Loss ────────────────────────────────────────────────────────
 
 class VesselLoss(nn.Module):
     """
     L = Dice(pred, gt, W) + BCE_hard_neg(logits, gt, W) + λ_cl·clDice(pred, gt, W)
-        + λ_ct·prototype_contrastive(feats, gt)        (when feats provided)
-
-    All three pixel losses gated by Hanning weight map W. BCE additionally uses
-    hard-negative mining to fight over-prediction in low-intensity background.
-    Prototype contrastive on decoder features is optional — pass `feats=None` to
-    disable (e.g. during inference).
+        + λ_bd·sharpness_boundary(pred, sharpness)      (when sharpness provided)
+        + λ_ct·prototype_contrastive(feats, gt)          (when feats provided)
 
     Hyperparameters:
-      lambda_cldice    weight on clDice (topology-aware Dice)        default 0.5
-      lambda_contrast  weight on prototype contrastive               default 0.1
-      hard_neg_factor  peak boost for confidently-wrong bg pixels    default 2.0
+      lambda_cldice    weight on clDice                  default 1.0
+      lambda_boundary  weight on sharpness boundary loss default 0.5
+      lambda_contrast  weight on prototype contrastive   default 0.1
+      hard_neg_factor  peak boost for wrong bg pixels    default 2.0
     """
-    def __init__(self, lambda_cldice=0.5, lambda_contrast=0.1, hard_neg_factor=2.0):
+    def __init__(self, lambda_cldice=1.0, lambda_boundary=0.5,
+                 lambda_contrast=0.1, hard_neg_factor=2.0):
         super().__init__()
-        self.lam            = lambda_cldice
-        self.lam_ct         = lambda_contrast
+        self.lam             = lambda_cldice
+        self.lam_bd          = lambda_boundary
+        self.lam_ct          = lambda_contrast
         self.hard_neg_factor = hard_neg_factor
 
-    def forward(self, logits, target, hann_weight, feats=None):
+    def forward(self, logits, target, hann_weight, sharpness=None, feats=None):
         """
         logits:      (B, 1, H, W)   raw decoder output
         target:      (B, 1, H, W)   binary float mask
-        hann_weight: (B, 1, H, W)   Hanning gate
-        feats:       (B, C, H, W)   optional decoder features for contrastive loss
+        hann_weight: (B, 1, H, W)   Hanning × sharpness gate
+        sharpness:   (B, 1, H, W)   per-pixel sharpness map (optional)
+        feats:       (B, C, H, W)   decoder features for contrastive loss (optional)
         """
         pred = torch.sigmoid(logits)
 
@@ -293,19 +345,31 @@ class VesselLoss(nn.Module):
                                    hard_neg_factor=self.hard_neg_factor)
         l_cl   = cldice_loss(pred, target, hann_weight)
 
-        # Contrastive only contributes when features are passed in — keeps
-        # inference / val paths free of the extra compute.
+        total = l_dice + l_bce + self.lam * l_cl
+
+        # Boundary penalty: discourage predictions that cross sharp→blurry edges.
+        if sharpness is not None and self.lam_bd > 0:
+            # Resize sharpness to match logits resolution if SAM2 changed spatial dims.
+            s = sharpness if sharpness.shape == logits.shape else \
+                F.interpolate(sharpness, size=logits.shape[-2:], mode='bilinear', align_corners=False)
+            l_bd   = sharpness_boundary_loss(logits, s)
+            total  = total + self.lam_bd * l_bd
+            l_bd_val = l_bd.item()
+        else:
+            l_bd_val = 0.0
+
+        # Contrastive only contributes when features are passed in.
         if feats is not None and self.lam_ct > 0:
-            l_ct = prototype_contrastive_loss(feats, target)
-            total = l_dice + l_bce + self.lam * l_cl + self.lam_ct * l_ct
+            l_ct   = prototype_contrastive_loss(feats, target)
+            total  = total + self.lam_ct * l_ct
             l_ct_val = l_ct.item()
         else:
-            total = l_dice + l_bce + self.lam * l_cl
             l_ct_val = 0.0
 
         return total, {
             'dice':       l_dice.item(),
             'bce':        l_bce.item(),
             'cldice':     l_cl.item(),
+            'boundary':   l_bd_val,
             'contrast':   l_ct_val,
         }

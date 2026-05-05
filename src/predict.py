@@ -7,7 +7,7 @@ import torch
 from tifffile import imread, imwrite
 from tqdm import tqdm
 
-from dataset     import normalize, tile_image, stitch_tiles, load_pairs
+from dataset     import normalize, tile_image, stitch_tiles, load_pairs, compute_sharpness, compute_gradient_magnitude
 from model       import VesselSegNet
 from postprocess import postprocess           # rule-based mask cleanup
 import wandb
@@ -39,7 +39,11 @@ def predict_image(model, img_path, device):
                     img_tile.astype(np.float32) / 255.0
                 ).unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, H, W)
 
-            logits, _ = model(t, use_graph=True)   # full graph-refined path; coarse_logits unused at inference
+            sharp   = compute_sharpness(img_tile)
+            grad    = compute_gradient_magnitude(img_tile)
+            sharp_t = torch.from_numpy(sharp).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
+            grad_t  = torch.from_numpy(grad).unsqueeze(0).unsqueeze(0).to(device)   # (1,1,H,W)
+            logits, _ = model(t, use_graph=True, sharpness=sharp_t, grad_mag=grad_t)
             prob   = torch.sigmoid(logits).squeeze().cpu().numpy()  # (H, W)
             tile_probs.append(prob)
             tile_xs.append(x_off)

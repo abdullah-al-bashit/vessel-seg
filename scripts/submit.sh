@@ -45,7 +45,7 @@ python src/train.py \
     --output_dir  $OUTPUT_DIR \
     --ckpt_dir    $CKPT_DIR   \
     --folds       1           \
-    --epochs      80          \
+    --epochs      50          \
     --batch_size  8           \
     --lr          1e-4
 

@@ -5,11 +5,44 @@ import torch
 from torch.utils.data import Dataset
 from tifffile import imread
 from skimage.transform import resize
-from scipy.ndimage import map_coordinates, gaussian_filter
+from scipy.ndimage import map_coordinates, gaussian_filter, uniform_filter, laplace, sobel
 
 TILE_W  = 1024
 TILE_H  = 1300   # full strip height — no vertical cuts
 STRIDE  = 512    # horizontal stride only
+
+
+# ── Gradient magnitude map ────────────────────────────────────────────────────
+
+def compute_gradient_magnitude(img):
+    """
+    Sobel gradient magnitude — highlights intensity edges (vessel walls).
+    Returns (H, W) float32 normalised by the global max.
+    """
+    img_f = img.astype(np.float32)
+    gx    = sobel(img_f, axis=1)
+    gy    = sobel(img_f, axis=0)
+    grad  = np.sqrt(gx ** 2 + gy ** 2)
+    return (grad / (grad.max() + 1e-8)).astype(np.float32)
+
+
+# ── Sharpness map ─────────────────────────────────────────────────────────────
+
+def compute_sharpness(img, window=64):
+    """
+    Local variance of Laplacian (VoL) — standard focus/blur measure.
+    Sharp in-focus regions have large second derivatives; blurry/out-of-focus
+    regions have near-zero Laplacian response.
+
+    Returns (H, W) float32 normalised by the global max VoL.
+    No clipping — preserves relative contrast between all sharpness levels.
+    """
+    img_f     = img.astype(np.float32)
+    lap       = laplace(img_f)
+    mean_lap2 = uniform_filter(lap ** 2, size=window)
+    mean_lap  = uniform_filter(lap,      size=window)
+    vol       = np.maximum(mean_lap2 - mean_lap ** 2, 0)
+    return (vol / (vol.max() + 1e-8)).astype(np.float32)
 
 
 # ── Normalization ──────────────────────────────────────────────────────────────
@@ -160,30 +193,38 @@ class VesselDataset(Dataset):
                     img_tile = _pad_tile(img_tile, TILE_H, TILE_W)
                     msk_tile = _pad_tile(msk_tile, TILE_H, TILE_W)
 
+                sharp = compute_sharpness(img_tile)              # (H, W) float32 [0,1]
+                grad  = compute_gradient_magnitude(img_tile)     # (H, W) float32 [0,1]
+                hann_sharp = hann * sharp                        # (H, W) — blurry pixels downweighted
+
                 self.items.append((
                     img_tile.copy(),
                     msk_tile.copy(),
-                    hann.copy()
+                    hann_sharp.copy(),
+                    sharp.copy(),
+                    grad.copy(),
                 ))
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        img, msk, hann = self.items[idx]
+        img, msk, hann, sharp, grad = self.items[idx]
 
         if self.augment:
-            # Seed derived from base seed + idx so each sample is independently
-            # reproducible; None falls through to a random RNG inside _augment.
             rng = np.random.default_rng(self.seed + idx) if self.seed is not None else None
             img, msk = _augment(img, msk, rng=rng)
+            sharp = compute_sharpness(img)
+            grad  = compute_gradient_magnitude(img)
+            hann  = hann * sharp / (sharp.max() + 1e-8)  # re-weight hanning
 
-        # img: (H, W) uint8 → float32 tensor (1, H, W)
-        img_t  = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
-        msk_t  = torch.from_numpy(msk.astype(np.float32)).unsqueeze(0)
-        hann_t = torch.from_numpy(hann).unsqueeze(0)
+        img_t   = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
+        msk_t   = torch.from_numpy(msk.astype(np.float32)).unsqueeze(0)
+        hann_t  = torch.from_numpy(hann).unsqueeze(0)
+        sharp_t = torch.from_numpy(sharp).unsqueeze(0)
+        grad_t  = torch.from_numpy(grad).unsqueeze(0)
 
-        return img_t, msk_t, hann_t
+        return img_t, msk_t, hann_t, sharp_t, grad_t
 
 
 # ── Augmentation ───────────────────────────────────────────────────────────────
@@ -246,6 +287,15 @@ def _augment(img, msk, rng=None):
         coords = [np.clip(ys + dy, 0, h - 1), np.clip(xs + dx, 0, w - 1)]
         img = map_coordinates(img, coords, order=1, mode='reflect').astype(img.dtype)
         msk = map_coordinates(msk, coords, order=0, mode='reflect').astype(msk.dtype)
+
+    # ── Blur augmentation ──────────────────────────────────────────────────────
+    # Randomly simulate out-of-focus regions by Gaussian-blurring the whole
+    # tile. The GT mask is unchanged — the model learns that blurry texture
+    # maps to the same (or no) vessel annotations, making it conservative in
+    # blurry regions at inference time.
+    if rng.random() > 0.7:
+        sigma_blur = rng.uniform(1.5, 4.0)
+        img = gaussian_filter(img.astype(np.float32), sigma=sigma_blur).astype(np.uint8)
 
     # ── Intensity ──────────────────────────────────────────────────────────────
     # Gaussian noise: simulates sensor noise; only applied to image, not mask.
