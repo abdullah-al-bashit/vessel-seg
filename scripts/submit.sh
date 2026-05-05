@@ -45,17 +45,15 @@ python src/train.py \
     --output_dir  $OUTPUT_DIR \
     --ckpt_dir    $CKPT_DIR   \
     --folds       1           \
-    --epochs      1           \
+    --epochs      80          \
     --batch_size  8           \
     --lr          1e-4
 
 echo "Training done: $(date)"
 
-# ── Predict: run on all images using best checkpoint ──────────────────────────
-python src/predict.py \
-    --input_dir  $INPUT_DIR          \
-    --mask_dir   $OUTPUT_DIR         \
-    --ckpt_path  $CKPT_DIR/fold1_best.pth \
-    --out_dir    predictions
-
-echo "Done: $(date)"
+# ── Submit predict as a separate job dependent on this job's success ───────────
+# --dependency=afterok:$SLURM_JOB_ID ensures the predict job only starts once
+# this training job exits with status 0 (success). If training fails or is
+# cancelled, the predict job is automatically held and never runs.
+PREDICT_JOB=$(sbatch --parsable --dependency=afterok:$SLURM_JOB_ID scripts/submit_predict.sh)
+echo "Predict job submitted: $PREDICT_JOB  (runs after this job exits)"
