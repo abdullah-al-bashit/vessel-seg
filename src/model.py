@@ -1286,6 +1286,7 @@ class AttentionGate(nn.Module):
             g1 = F.interpolate(g1, size=x.shape[2:], mode='bilinear', align_corners=False)
         x1 = self.W_x(x)
         psi = self.sigmoid(self.psi(self.relu(g1 + x1)))
+        self.last_psi = psi.detach()  # Save for visualization (no grad overhead)
         return x * psi
 
 
@@ -1367,3 +1368,68 @@ class AttentionUNet(nn.Module):
             logits = F.interpolate(logits, size=x.shape[2:], mode='bilinear', align_corners=False)
 
         return logits, None, None
+
+
+def visualize_attention_maps(model, img_rgb_np):
+    """
+    Extract and visualize attention maps from all 3 gates of AttentionUNet.
+    Must be called after a forward pass (reads model.att{1,2,3}.last_psi).
+
+    Args:
+        model:       AttentionUNet instance
+        img_rgb_np:  (H, W, 3) uint8 RGB — input image for overlay
+
+    Returns:
+        dict of {gate_view: wandb.Image} — 9 panels total
+    """
+    import matplotlib.cm as cm
+    try:
+        import wandb
+    except ImportError:
+        return {}
+
+    H, W = img_rgb_np.shape[:2]
+    panels = {}
+
+    def to_heatmap(psi_np):
+        """(H, W) float [0,1] → (H, W, 3) uint8 jet colormap"""
+        colored = (cm.jet(psi_np)[:, :, :3] * 255).astype(np.uint8)
+        return colored
+
+    def blend(base, heatmap, alpha=0.5):
+        """Blend heatmap onto base image"""
+        return (alpha * heatmap.astype(np.float32) + (1 - alpha) * base.astype(np.float32)).astype(np.uint8)
+
+    for gate_name, gate in [("attn1", model.att1), ("attn2", model.att2), ("attn3", model.att3)]:
+        if not hasattr(gate, 'last_psi') or gate.last_psi is None:
+            continue
+
+        psi = gate.last_psi[0, 0].cpu().numpy()  # (H_att, W_att) float [0,1]
+
+        # Upsample to full image resolution (bilinear)
+        psi_t = torch.from_numpy(psi).unsqueeze(0).unsqueeze(0)
+        psi_full = F.interpolate(psi_t, size=(H, W), mode='bilinear', align_corners=False)[0, 0].numpy()
+
+        # View 1: raw heatmap (jet colormap)
+        heatmap = to_heatmap(psi_full)
+        panels[f"{gate_name}_heatmap"] = wandb.Image(
+            heatmap,
+            caption=f"{gate_name} α (jet: red=attended, blue=suppressed)"
+        )
+
+        # View 2: overlay on input image
+        overlay = blend(img_rgb_np, heatmap)
+        panels[f"{gate_name}_overlay"] = wandb.Image(
+            overlay,
+            caption=f"{gate_name} α overlay on input"
+        )
+
+        # View 3: psi as grayscale (white=attended, black=suppressed)
+        psi_gray = (psi_full * 255).astype(np.uint8)
+        psi_rgb = np.stack([psi_gray] * 3, axis=-1)
+        panels[f"{gate_name}_alpha"] = wandb.Image(
+            psi_rgb,
+            caption=f"{gate_name} raw α [white=attended, black=suppressed]"
+        )
+
+    return panels

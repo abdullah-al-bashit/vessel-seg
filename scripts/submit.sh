@@ -65,14 +65,17 @@ echo "Config:    $CONFIG"
 echo "CKPT_DIR:  $CKPT_DIR"
 
 # ── Train ─────────────────────────────────────────────────────────────────────
-# EPOCHS env var overrides the config value — useful for quick timing tests:
+# Environment vars override config values — useful for quick tests and GPU optimization:
 #   sbatch --export=ALL,EPOCHS=1 scripts/submit.sh
+#   sbatch --export=ALL,BATCH_SIZE=96,NUM_WORKERS=32 scripts/submit.sh
 python src/train.py \
     --config     $CONFIG    \
     --input_dir  $INPUT_DIR \
     --output_dir $OUTPUT_DIR \
     --ckpt_dir   $CKPT_DIR  \
-    ${EPOCHS:+--epochs $EPOCHS}
+    ${EPOCHS:+--epochs $EPOCHS} \
+    ${BATCH_SIZE:+--batch_size $BATCH_SIZE} \
+    ${NUM_WORKERS:+--num_workers $NUM_WORKERS}
 
 echo "Training done: $(date)"
 
@@ -82,6 +85,6 @@ echo "Training done: $(date)"
 # a hardcoded path that could point to a different run's model.
 PREDICT_JOB=$(sbatch --parsable \
     --dependency=afterok:$SLURM_JOB_ID \
-    --export=ALL,CKPT_PATH=$CKPT_DIR/fold1_best.pth \
+    --export=ALL,CKPT_PATH=$CKPT_DIR/best_model.pth \
     scripts/submit_predict.sh)
-echo "Predict job submitted: $PREDICT_JOB  (ckpt: $CKPT_DIR/fold1_best.pth)"
+echo "Predict job submitted: $PREDICT_JOB  (ckpt: $CKPT_DIR/best_model.pth)"

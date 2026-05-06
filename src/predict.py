@@ -10,7 +10,7 @@ from tifffile import imread, imwrite
 from tqdm import tqdm
 
 from dataset     import normalize, tile_image, stitch_tiles, load_pairs, compute_sharpness, compute_gradient_magnitude
-from model       import VesselSegNet, AttentionUNet
+from model       import VesselSegNet, AttentionUNet, visualize_attention_maps
 from postprocess import postprocess           # rule-based mask cleanup
 import wandb
 
@@ -227,6 +227,11 @@ def main(args):
                 "combined":    wandb.Image(make_combined(mask, gt),
                                            caption=f"{cap}  |  raw  |  green=TP  red=FP  cyan=FN"),
             })
+
+        # Log attention maps (last tile's attention from AttentionUNet)
+        if hasattr(model, 'att1'):
+            attn_panels = visualize_attention_maps(model, img_rgb)
+            log_payload.update({f"attn/{k}": v for k, v in attn_panels.items()})
 
         wandb.log(log_payload)
 

@@ -3,6 +3,7 @@ import json
 import time
 import argparse
 import random  # used in set_seed
+import shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ from tqdm import tqdm
 from tifffile import imread as tif_imread
 
 from dataset import load_pairs, VesselDataset
-from model   import VesselSegNet, AttentionUNet
+from model   import VesselSegNet, AttentionUNet, visualize_attention_maps
 from loss    import VesselLoss
 from predict import predict_image  # full-image stitched inference for test Dice
 import wandb
@@ -39,7 +40,8 @@ def set_seed(seed=42):
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
               feat_capture=None, use_graph=None, lambda_coarse=0.4,
-              sharp_gate=False, use_focus_gate=False, lambda_focus=0.5):
+              sharp_gate=False, use_focus_gate=False, lambda_focus=0.5,
+              epoch=None, fold=None):
     """
     feat_capture: optional dict populated by a forward hook (see main()) that
                   holds the decoder features under key 'feats'. Passed to
@@ -56,7 +58,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
     # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for img, msk, hann, sharp, grad in tqdm(loader):
+        for batch_idx, (img, msk, hann, sharp, grad) in enumerate(tqdm(loader)):
             img   = img.to(device)
             msk   = msk.to(device)
             hann  = hann.to(device)
@@ -99,6 +101,16 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
             total_loss += loss.item()                      # scalar float — .item() detaches from graph
             for k in total_parts:
                 total_parts[k] += loss_dict[k]  # scalar float — loss_dict values are already Python floats via .item() in VesselLoss
+
+            # Log attention maps every 10 validation epochs on first batch
+            if (not train) and (epoch is not None) and (fold is not None) and (epoch % 10 == 0) and (batch_idx == 0):
+                if hasattr(model, 'att1'):
+                    img_np = img[0, 0].cpu().numpy()
+                    lo, hi = np.percentile(img_np, (1, 99))
+                    img_u8 = np.clip((img_np - lo) / (hi - lo + 1e-8) * 255, 0, 255).astype(np.uint8)
+                    img_rgb = np.stack([img_u8] * 3, axis=-1)
+                    attn_panels = visualize_attention_maps(model, img_rgb)
+                    wandb.log({f"fold{fold+1}/{k}": v for k, v in attn_panels.items()})
 
     n = len(loader)                                        # number of batches in the epoch
     parts = {k: v / n for k, v in total_parts.items()}    # per-sub-loss epoch averages
@@ -249,7 +261,8 @@ def main(args):
 
             t_val_start = time.perf_counter()
             va_loss, va_parts = run_epoch(model, val_loader,   criterion,
-                                          None,    None,       device, train=False)
+                                          None,    None,       device, train=False,
+                                          epoch=epoch, fold=fold)
             t_val = time.perf_counter() - t_val_start
             scheduler.step()
 
@@ -313,6 +326,13 @@ def main(args):
     # Load the fold with the lowest val loss and evaluate once on the held-out test set.
     best_fold = int(np.argmin(best_loss_folds)) + 1
     print(f'\nEvaluating fold {best_fold} (lowest val loss) on held-out test set ...')
+
+    # Copy best fold's checkpoint to stable path for predict job
+    shutil.copy(
+        os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
+        os.path.join(args.ckpt_dir, 'best_model.pth')
+    )
+
     set_seed(args.seed)
 
     test_ds     = VesselDataset(test_pairs, augment=False, seed=args.seed,
