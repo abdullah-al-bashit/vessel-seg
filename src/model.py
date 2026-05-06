@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,12 +59,15 @@ class SAM2Encoder(nn.Module):
     (e.g. H/4, H/8, H/16, H/32) so both fine detail and broad context are captured.
     feats[0] is the finest (highest resolution), feats[3] is the coarsest.
     """
-    def __init__(self, hf_model_id=HF_MODEL_ID):
+    def __init__(self, hf_model_id=HF_MODEL_ID, local_dir=None):
         super().__init__()
         from transformers import Sam2Model, Sam2Processor  # lazy import — avoids load at module level
 
-        self.processor = Sam2Processor.from_pretrained(hf_model_id)  # handles image pre-processing (resize, normalize, pad)
-        self.sam2      = Sam2Model.from_pretrained(hf_model_id)       # full SAM2 model (encoder + prompt + decoder)
+        # Use pre-downloaded local copy when available; avoids re-downloading on each node.
+        load_path = local_dir if (local_dir and os.path.isdir(local_dir)) else hf_model_id
+        print(f'SAM2 loading from: {load_path}')
+        self.processor = Sam2Processor.from_pretrained(load_path)
+        self.sam2      = Sam2Model.from_pretrained(load_path)
 
         # Freeze entire vision encoder — Hiera ViT weights never updated during training
         for name, p in self.sam2.named_parameters():
@@ -1109,9 +1113,9 @@ class VesselSegNet(nn.Module):
                         head Conv1×1
                         (B,1,H,W) logits
     """
-    def __init__(self, sam2_model=HF_MODEL_ID):
+    def __init__(self, sam2_model=HF_MODEL_ID, sam2_local_dir=None):
         super().__init__()
-        self.encoder   = SAM2Encoder(hf_model_id=sam2_model)                   # frozen Hiera ViT-L
+        self.encoder   = SAM2Encoder(hf_model_id=sam2_model, local_dir=sam2_local_dir)
         self.cnn_dec   = CNNDecoder(in_ch=256)                                  # (B,256,H/4,W/4)→(B,32,H,W)
         self.graph_net = VesselGraphNet(in_ch=NODE_FEAT_DIM, hidden=64,         # (N,39)→(N,64)
                                         out_ch=64, K=10)
@@ -1122,7 +1126,7 @@ class VesselSegNet(nn.Module):
         # scale init=1, bias init=0 → starts as sigmoid(sharpness); bias shifts positive
         # during training to prevent full feature suppression in blurry regions.
         self.sharp_gate_scale = nn.Parameter(torch.ones(32))                    # (32,) per decoder channel
-        self.sharp_gate_bias  = nn.Parameter(torch.zeros(32))                   # (32,) per decoder channel
+        self.sharp_gate_bias  = nn.Parameter(torch.full((32,), 2.0))             # init=2 → floor sigmoid(2)≈0.88, prevents collapse
 
     def forward(self, x, use_graph=True, sharpness=None, grad_mag=None, sharp_gate=False, use_focus_gate=False):
         """

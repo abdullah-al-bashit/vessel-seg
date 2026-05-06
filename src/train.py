@@ -39,7 +39,7 @@ def set_seed(seed=42):
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
               feat_capture=None, use_graph=None, lambda_coarse=0.4,
-              use_focus_gate=False, lambda_focus=0.5):
+              sharp_gate=False, use_focus_gate=False, lambda_focus=0.5):
     """
     feat_capture: optional dict populated by a forward hook (see main()) that
                   holds the decoder features under key 'feats'. Passed to
@@ -64,7 +64,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
             grad  = grad.to(device)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                logits, coarse_logits, focus_logits = model(img, use_graph=use_graph, sharpness=sharp, grad_mag=grad, sharp_gate=args.sharp_gate, use_focus_gate=use_focus_gate)
+                logits, coarse_logits, focus_logits = model(img, use_graph=use_graph, sharpness=sharp, grad_mag=grad, sharp_gate=sharp_gate, use_focus_gate=use_focus_gate)
                 feats  = feat_capture.get('feats') if (train and feat_capture is not None) else None
                 loss, loss_dict = criterion(logits, msk, hann, sharpness=sharp, feats=feats)
                 if train and coarse_logits is not None:
@@ -194,7 +194,7 @@ def main(args):
                                   pin_memory=True,
                                   persistent_workers=True)
 
-        model     = VesselSegNet(sam2_model=args.sam2_model).to(device)
+        model     = VesselSegNet(sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir).to(device)
 
         # Forward hook registered before compile so it fires on the underlying module.
         captured = {}
@@ -230,6 +230,7 @@ def main(args):
                                           use_graph=use_graph,
                                           feat_capture=captured,
                                           lambda_coarse=args.lambda_coarse,
+                                          sharp_gate=args.sharp_gate,
                                           use_focus_gate=args.use_focus_gate,
                                           lambda_focus=args.lambda_focus)
             t_train = time.perf_counter() - t_train_start
@@ -308,7 +309,7 @@ def main(args):
                              shuffle=False, num_workers=args.num_workers, pin_memory=True,
                              persistent_workers=True)
 
-    model = VesselSegNet(sam2_model=args.sam2_model).to(device)
+    model = VesselSegNet(sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir).to(device)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
                                      map_location=device))
     criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
@@ -329,7 +330,7 @@ def main(args):
     print('\nStitched-image Dice on test set:')
     dice_per_image = []
     for img_path, msk_path in test_pairs:
-        pred_mask = predict_image(model, img_path, device)        # (H, W) bool
+        pred_mask = predict_image(model, img_path, device, sharp_gate=args.sharp_gate, use_focus_gate=args.use_focus_gate)
         gt_mask   = tif_imread(msk_path) > 0                       # (H, W) bool
         inter     = float(np.logical_and(pred_mask, gt_mask).sum())
         denom     = float(pred_mask.sum() + gt_mask.sum())
@@ -397,7 +398,10 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_coarse',   type=float, default=0.4)
     parser.add_argument('--hard_neg_factor', type=float, default=2.0)
     # ── Model ─────────────────────────────────────────────────────────────────
-    parser.add_argument('--sam2_model',   default='facebook/sam2.1-hiera-tiny')
+    parser.add_argument('--sam2_model',     default='facebook/sam2.1-hiera-tiny')
+    parser.add_argument('--sam2_local_dir', default=None,
+                        help='Path to pre-downloaded SAM2 weights. If the directory exists, '
+                             'skips HF Hub download. Run scripts/download_sam2.sh once to populate it.')
     # ── Dataset / augmentation ────────────────────────────────────────────────
     parser.add_argument('--plain_hann',     action='store_true')
     parser.add_argument('--sharp_gate',      action='store_true',

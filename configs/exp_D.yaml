@@ -40,3 +40,4 @@ lambda_focus: 0.5
 # ── Blur augmentation (train.py → VesselDataset → dataset.py _augment()) ──────
 blur_prob:      0.6          # 60% blur prob (from exp_C)
 blur_sigma_max: 8.0          # strong blur sigma (from exp_C)
+sam2_local_dir: "sam2_weights"  # relative to project root; pre-downloaded by scripts/download_sam2.sh

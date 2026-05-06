@@ -42,3 +42,4 @@ lambda_focus: 0.5
 # ── Blur augmentation (train.py → VesselDataset → dataset.py _augment()) ──────
 blur_prob:      0.3          # same as exp_A — isolates the plain_hann effect
 blur_sigma_max: 4.0
+sam2_local_dir: "sam2_weights"  # relative to project root; pre-downloaded by scripts/download_sam2.sh

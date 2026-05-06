@@ -42,3 +42,4 @@ blur_prob:      0.6          # 60% of tiles get blur aug (vs 30% in exp_A/B)
                              # dataset.py _augment(): if rng.random() < blur_prob → gaussian_filter
 blur_sigma_max: 8.0          # twice as strong as exp_A — sigma ~ Uniform(1.5, 8.0)
                              # dataset.py _augment(): sigma ~ Uniform(1.5, blur_sigma_max)
+sam2_local_dir: "sam2_weights"  # relative to project root; pre-downloaded by scripts/download_sam2.sh

@@ -13,7 +13,7 @@ from postprocess import postprocess           # rule-based mask cleanup
 import wandb
 
 
-def predict_image(model, img_path, device):
+def predict_image(model, img_path, device, sharp_gate=False, use_focus_gate=False):
     """
     Full inference pipeline for one image.
     1. Load + normalize
@@ -43,7 +43,7 @@ def predict_image(model, img_path, device):
             grad    = compute_gradient_magnitude(img_tile)
             sharp_t = torch.from_numpy(sharp).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
             grad_t  = torch.from_numpy(grad).unsqueeze(0).unsqueeze(0).to(device)   # (1,1,H,W)
-            logits, _, _ = model(t, use_graph=False, sharpness=sharp_t, grad_mag=grad_t, sharp_gate=args.sharp_gate, use_focus_gate=args.use_focus_gate)
+            logits, _, _ = model(t, use_graph=False, sharpness=sharp_t, grad_mag=grad_t, sharp_gate=sharp_gate, use_focus_gate=use_focus_gate)
             prob   = torch.sigmoid(logits).squeeze().cpu().numpy()  # (H, W)
             tile_probs.append(prob)
             tile_xs.append(x_off)
@@ -63,7 +63,7 @@ def main(args):
     )
     print(f'Device: {device}')
 
-    model = VesselSegNet().to(device)
+    model = VesselSegNet(sam2_local_dir=args.sam2_local_dir).to(device)
     model.load_state_dict(torch.load(args.ckpt_path, map_location=device))
     model.eval()
 
@@ -103,7 +103,7 @@ def main(args):
         fname = os.path.basename(img_path).replace('.tif', '_pred.tif')
         out_path = os.path.join(args.out_dir, fname)
 
-        mask    = predict_image(model, img_path, device)        # raw model output
+        mask    = predict_image(model, img_path, device, sharp_gate=args.sharp_gate, use_focus_gate=args.use_focus_gate)
         mask_pp = postprocess(mask)                              # cleaned: small blobs removed, holes filled, gaps closed
 
         # Save the postprocessed mask (cleaner, what you'd actually use downstream).
@@ -210,8 +210,11 @@ if __name__ == '__main__':
     parser.add_argument('--out_dir',    default='../predictions')
     parser.add_argument('--sharp_gate',      action='store_true')
     parser.add_argument('--use_focus_gate', action='store_true')
-    parser.add_argument('--mask_dir',   default=None,
+    parser.add_argument('--mask_dir',     default=None,
                         help='Optional ground-truth mask folder. If given, log a per-image '
                              'TP/FP/FN error map (green/red/yellow) alongside the prediction.')
+    parser.add_argument('--sam2_local_dir', default=None,
+                        help='Path to pre-downloaded SAM2 weights directory. '
+                             'Skips HF Hub download when the directory exists.')
     args = parser.parse_args()
     main(args)

@@ -48,11 +48,13 @@ mkdir -p $CKPT_DIR
 # All hyperparameters (epochs, lr, loss weights, blur aug, sam2_model, …) live
 # in the YAML file — this script only handles cluster-specific paths.
 #
-# Submit all 4 experiments:
-#   sbatch scripts/submit.sh                                          # A: baseline
-#   sbatch --export=ALL,CONFIG=configs/exp_B.yaml scripts/submit.sh  # B: plain hann
-#   sbatch --export=ALL,CONFIG=configs/exp_C.yaml scripts/submit.sh  # C: more blur
-#   sbatch --export=ALL,CONFIG=configs/exp_D.yaml scripts/submit.sh  # D: both
+# Current default: exp_A with base-plus model
+#   sbatch scripts/submit.sh                  # runs exp_A (base-plus SAM2 encoder)
+#
+# Other experiments (commented out, previously tested blur/gate configurations):
+#   # sbatch --export=ALL,CONFIG=configs/exp_B.yaml scripts/submit.sh  # B: plain hann + learnable sharp gate
+#   # sbatch --export=ALL,CONFIG=configs/exp_C.yaml scripts/submit.sh  # C: aggressive blur + focus head
+#   # sbatch --export=ALL,CONFIG=configs/exp_D.yaml scripts/submit.sh  # D: plain hann + aggressive blur
 CONFIG="${CONFIG:-configs/exp_A.yaml}"
 
 # Copy config into checkpoint dir so the run is self-documenting — inspecting
