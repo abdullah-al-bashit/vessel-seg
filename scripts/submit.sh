@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vessel_seg
+#SBATCH --job-name=vessel_train
 #SBATCH --output=/home/a.bashit/vessel_seg/logs/train_%j.out
 #SBATCH --error=/home/a.bashit/vessel_seg/logs/train_%j.err
 #SBATCH --partition=gpu

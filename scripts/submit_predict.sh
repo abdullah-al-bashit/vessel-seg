@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vessel_predict
+#SBATCH --job-name=vessel_pred
 #SBATCH --output=/home/a.bashit/vessel_seg/logs/predict_%j.out
 #SBATCH --error=/home/a.bashit/vessel_seg/logs/predict_%j.err
 #SBATCH --partition=gpu
