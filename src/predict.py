@@ -137,6 +137,7 @@ def main(args):
             "input_files": img_paths,    # exact list of images being predicted
         }
     )
+    print(f'Using model: {args.ckpt_path}')
     print(f'Images to predict: {len(img_paths)}')
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -231,6 +232,7 @@ def main(args):
         # Log attention maps (last tile's attention from AttentionUNet)
         if hasattr(model, 'att1'):
             attn_panels = visualize_attention_maps(model, img_rgb)
+            log_payload[f"attn/input_image"] = wandb.Image(img_rgb, caption=f"Input full image: {fname}")
             log_payload.update({f"attn/{k}": v for k, v in attn_panels.items()})
 
         wandb.log(log_payload)

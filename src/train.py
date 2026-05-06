@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from tifffile import imread as tif_imread
 
-from dataset import load_pairs, VesselDataset
+from dataset import load_pairs, VesselDataset, collate_fn_with_filenames
 from model   import VesselSegNet, AttentionUNet, visualize_attention_maps
 from loss    import VesselLoss
 from predict import predict_image  # full-image stitched inference for test Dice
@@ -58,12 +58,13 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
     # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for batch_idx, (img, msk, hann, sharp, grad) in enumerate(tqdm(loader)):
-            img   = img.to(device)
-            msk   = msk.to(device)
-            hann  = hann.to(device)
-            sharp = sharp.to(device)
-            grad  = grad.to(device)
+        for batch_idx, batch_data in enumerate(tqdm(loader)):
+            img   = batch_data[0].to(device)
+            msk   = batch_data[1].to(device)
+            hann  = batch_data[2].to(device)
+            sharp = batch_data[3].to(device)
+            grad  = batch_data[4].to(device)
+            fnames = batch_data[5]  # List of filenames (not a tensor)
 
             with autocast(device_type=device.type, enabled=use_amp):
                 logits, coarse_logits, focus_logits = model(img, use_graph=use_graph, sharpness=sharp, grad_mag=grad, sharp_gate=sharp_gate, use_focus_gate=use_focus_gate)
@@ -105,12 +106,21 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
             # Log attention maps every 10 validation epochs on first batch
             if (not train) and (epoch is not None) and (fold is not None) and (epoch % 10 == 0) and (batch_idx == 0):
                 if hasattr(model, 'att1'):
-                    img_np = img[0, 0].cpu().numpy()
-                    lo, hi = np.percentile(img_np, (1, 99))
-                    img_u8 = np.clip((img_np - lo) / (hi - lo + 1e-8) * 255, 0, 255).astype(np.uint8)
-                    img_rgb = np.stack([img_u8] * 3, axis=-1)
-                    attn_panels = visualize_attention_maps(model, img_rgb)
-                    wandb.log({f"fold{fold+1}/{k}": v for k, v in attn_panels.items()})
+                    try:
+                        img_np = img[0, 0].cpu().numpy()
+                        lo, hi = np.percentile(img_np, (1, 99))
+                        img_u8 = np.clip((img_np - lo) / (hi - lo + 1e-8) * 255, 0, 255).astype(np.uint8)
+                        img_rgb = np.stack([img_u8] * 3, axis=-1)
+                        attn_panels = visualize_attention_maps(model, img_rgb)
+                        fname = fnames[0]  # fnames is a list of filenames from custom collate
+                        log_dict = {
+                            f"fold{fold+1}/input_image": wandb.Image(img_rgb, caption=f"Input tile from {fname}"),
+                        }
+                        log_dict.update({f"fold{fold+1}/{k}": v for k, v in attn_panels.items()})
+                        wandb.log(log_dict)
+                        print(f'  ✓ logged input + {len(attn_panels)} attention panels (fold {fold+1}, epoch {epoch}, file: {fname})')
+                    except Exception as e:
+                        print(f'  ⚠ attention logging failed: {e}')
 
     n = len(loader)                                        # number of batches in the epoch
     parts = {k: v / n for k, v in total_parts.items()}    # per-sub-loss epoch averages
@@ -212,11 +222,13 @@ def main(args):
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                   shuffle=True,  num_workers=args.num_workers,
                                   pin_memory=True,         # allocates batches in CPU memory that the GPU can read directly, avoiding an extra copy
-                                  persistent_workers=True) # keeps worker processes alive between epochs so they don't need to be spawned again each epoch
+                                  persistent_workers=True, # keeps worker processes alive between epochs so they don't need to be spawned again each epoch
+                                  collate_fn=collate_fn_with_filenames)
         val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                                   shuffle=False, num_workers=args.num_workers,
                                   pin_memory=True,
-                                  persistent_workers=True)
+                                  persistent_workers=True,
+                                  collate_fn=collate_fn_with_filenames)
 
         model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
 
@@ -325,13 +337,20 @@ def main(args):
     # ── Final test evaluation ──────────────────────────────────────────────────
     # Load the fold with the lowest val loss and evaluate once on the held-out test set.
     best_fold = int(np.argmin(best_loss_folds)) + 1
-    print(f'\nEvaluating fold {best_fold} (lowest val loss) on held-out test set ...')
+    best_fold_loss = best_loss_folds[best_fold - 1]
+    print(f'\nEvaluating fold {best_fold} (lowest val loss {best_fold_loss:.4f}) on held-out test set ...')
 
     # Copy best fold's checkpoint to stable path for predict job
-    shutil.copy(
-        os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
-        os.path.join(args.ckpt_dir, 'best_model.pth')
-    )
+    best_fold_ckpt = os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth')
+    best_model_ckpt = os.path.join(args.ckpt_dir, 'best_model.pth')
+    shutil.copy(best_fold_ckpt, best_model_ckpt)
+
+    # Delete all fold-specific checkpoints (keep only best_model.pth)
+    for fold_num in range(1, args.folds + 1):
+        fold_ckpt = os.path.join(args.ckpt_dir, f'fold{fold_num}_best.pth')
+        if os.path.exists(fold_ckpt):
+            os.remove(fold_ckpt)
+            print(f'  deleted fold{fold_num}_best.pth')
 
     set_seed(args.seed)
 
@@ -339,7 +358,8 @@ def main(args):
                                 sharp_hann=not args.plain_hann)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size,
                              shuffle=False, num_workers=args.num_workers, pin_memory=True,
-                             persistent_workers=True)
+                             persistent_workers=True,
+                             collate_fn=collate_fn_with_filenames)
 
     model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),

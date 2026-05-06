@@ -180,13 +180,14 @@ class VesselDataset(Dataset):
         self.sharp_hann     = sharp_hann    # False → plain Hanning (no sharpness gate)
         self.blur_prob      = blur_prob
         self.blur_sigma_max = blur_sigma_max
-        self.items          = []            # (img_tile, msk_tile, hann, sharp, grad)
+        self.items          = []            # (img_tile, msk_tile, hann, sharp, grad, filename)
 
         hann = hanning_weight(TILE_H, TILE_W).astype(np.float32)
 
         for img_path, msk_path in pairs:
             img  = normalize(imread(img_path))   # (H, W) uint8
             msk  = imread(msk_path)              # (H, W) uint8
+            fname = os.path.basename(img_path)  # Extract filename for logging
 
             # vessel = 255 in your masks → bool
             msk  = (msk > 0).astype(np.uint8)
@@ -209,13 +210,14 @@ class VesselDataset(Dataset):
                     hann_w.copy(),
                     sharp.copy(),
                     grad.copy(),
+                    fname,
                 ))
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        img, msk, hann, sharp, grad = self.items[idx]
+        img, msk, hann, sharp, grad, fname = self.items[idx]
 
         if self.augment:
             rng = np.random.default_rng(self.seed + idx) if self.seed is not None else None
@@ -233,10 +235,17 @@ class VesselDataset(Dataset):
         sharp_t = torch.from_numpy(sharp).unsqueeze(0)
         grad_t  = torch.from_numpy(grad).unsqueeze(0)
 
-        return img_t, msk_t, hann_t, sharp_t, grad_t
+        return img_t, msk_t, hann_t, sharp_t, grad_t, fname
 
 
 # ── Augmentation ───────────────────────────────────────────────────────────────
+
+def collate_fn_with_filenames(batch):
+    """Custom collate for batches with tensors (0-4) and filenames (5)."""
+    tensors = [torch.stack([item[i] for item in batch]) for i in range(5)]
+    filenames = [item[5] for item in batch]
+    return tuple(tensors) + (filenames,)
+
 
 def _augment(img, msk, rng=None, blur_prob=0.3, blur_sigma_max=4.0):
     """Geometric and intensity augmentations for vessel segmentation.
