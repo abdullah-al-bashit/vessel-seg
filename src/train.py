@@ -172,6 +172,7 @@ def main(args):
     kf           = KFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)  # splitter object — actual split happens at kf.split() below
     pair_indices = list(range(len(trainval_pairs)))  # e.g. [0, 1, 2, ..., 23] for 24 trainval pairs
     best_loss_folds = []                             # best val loss per fold — used to select fold for test evaluation
+    best_epoch_folds = []                            # best epoch per fold — for tracking which checkpoint is best
 
     # Log every file's role (fold number + train/val/test) in one Table.
     # wandb.Table stores string data properly — wandb.log() with strings or lists
@@ -251,6 +252,7 @@ def main(args):
             optimizer, T_max=args.epochs, eta_min=1e-6)
 
         best_loss  = float('inf')  # best val loss this fold (full VesselLoss = soft_dice + bce + cldice)
+        best_epoch = 0             # which epoch had best validation loss
         no_improve = 0             # counter — resets to 0 whenever val loss improves, increments otherwise
 
         for epoch in range(1, args.epochs + 1):
@@ -310,6 +312,7 @@ def main(args):
             # model selection and early stopping based on full val loss (VesselLoss)
             if va_loss < best_loss:
                 best_loss  = va_loss
+                best_epoch = epoch
                 no_improve = 0
                 ckpt_path  = os.path.join(args.ckpt_dir, f'fold{fold+1}_best.pth')
                 torch.save(model.state_dict(), ckpt_path)
@@ -327,8 +330,9 @@ def main(args):
                     break
 
         best_loss_folds.append(best_loss)
-        print(f'Fold {fold+1} best val loss: {best_loss:.4f}')
-        wandb.log({f"fold{fold+1}/best_val_loss": best_loss})
+        best_epoch_folds.append(best_epoch)
+        print(f'Fold {fold+1} best val loss: {best_loss:.4f} (epoch {best_epoch})')
+        wandb.log({f"fold{fold+1}/best_val_loss": best_loss, f"fold{fold+1}/best_epoch": best_epoch})
         feat_hook.remove()  # detach the forward hook before next fold rebuilds the model
 
     print(f'\n{args.n_folds}-fold CV val loss: {np.mean(best_loss_folds):.4f} '
@@ -338,7 +342,8 @@ def main(args):
     # Load the fold with the lowest val loss and evaluate once on the held-out test set.
     best_fold = int(np.argmin(best_loss_folds)) + 1
     best_fold_loss = best_loss_folds[best_fold - 1]
-    print(f'\nEvaluating fold {best_fold} (lowest val loss {best_fold_loss:.4f}) on held-out test set ...')
+    best_fold_epoch = best_epoch_folds[best_fold - 1]
+    print(f'\nEvaluating fold {best_fold} (epoch {best_fold_epoch}, val loss {best_fold_loss:.4f}) on held-out test set ...')
 
     # Copy best fold's checkpoint to stable path for predict job
     best_fold_ckpt = os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth')
