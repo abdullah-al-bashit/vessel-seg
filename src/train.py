@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import gc
 import argparse
 import random  # used in set_seed
 import shutil
@@ -235,6 +236,11 @@ def main(args):
 
         model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
 
+        # Clear memory after model creation and before fold begins
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        gc.collect()
+
         # Forward hook registered before compile so it fires on the underlying module.
         captured = {}
         def _capture_features(_module, inputs, _output):
@@ -331,11 +337,21 @@ def main(args):
                     print(f'  Early stopping at epoch {epoch}')
                     break
 
+            # Explicit garbage collection and cache clearing after each epoch to prevent memory leaks
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect()
+
         best_loss_folds.append(best_loss)
         best_epoch_folds.append(best_epoch)
         print(f'Fold {fold+1} best val loss: {best_loss:.4f} (epoch {best_epoch})')
         wandb.log({f"fold{fold+1}/best_val_loss": best_loss, f"fold{fold+1}/best_epoch": best_epoch})
         feat_hook.remove()  # detach the forward hook before next fold rebuilds the model
+
+        # Explicit memory cleanup between folds to prevent accumulation across folds
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        gc.collect()
 
     print(f'\n{args.n_folds}-fold CV val loss: {np.mean(best_loss_folds):.4f} '
           f'± {np.std(best_loss_folds):.4f}')
