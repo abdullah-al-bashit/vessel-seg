@@ -1,9 +1,11 @@
 import os
+import sys
 import json
 import time
 import argparse
 import random  # used in set_seed
 import shutil
+import subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -408,6 +410,15 @@ def main(args):
         "cv_std_val_loss":       float(np.std(best_loss_folds)),
     })
     wandb.finish()   # marks the run complete and uploads any remaining data
+
+    # Generate publication-ready summary
+    summary_script = os.path.join(os.path.dirname(__file__), '..', 'scripts', 'summarize_cv.py')
+    log_file = os.path.join(os.path.dirname(args.ckpt_dir), f'train_{os.environ.get("SLURM_JOB_ID", "local")}.out')
+    if os.path.exists(summary_script) and os.path.exists(log_file):
+        try:
+            subprocess.run([sys.executable, summary_script, log_file], check=False, capture_output=False)
+        except Exception as e:
+            print(f'Warning: Could not generate summary: {e}')
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
