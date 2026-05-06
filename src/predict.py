@@ -2,15 +2,21 @@ import os
 import glob
 import json
 import argparse
+import yaml
+import random
 import numpy as np
 import torch
 from tifffile import imread, imwrite
 from tqdm import tqdm
 
 from dataset     import normalize, tile_image, stitch_tiles, load_pairs, compute_sharpness, compute_gradient_magnitude
-from model       import VesselSegNet
+from model       import VesselSegNet, AttentionUNet
 from postprocess import postprocess           # rule-based mask cleanup
 import wandb
+
+# ── Prediction filtering parameters ────────────────────────────────────────
+NUM_TRAINVAL_SAMPLES = 2  # number of random train-val images to predict
+NUM_TEST_SAMPLES = 5      # number of test images (all of them)
 
 
 def predict_image(model, img_path, device, sharp_gate=False, use_focus_gate=False):
@@ -54,6 +60,16 @@ def predict_image(model, img_path, device, sharp_gate=False, use_focus_gate=Fals
     return mask
 
 
+def create_model(model_type, device, sam2_local_dir=None):
+    """Create model based on architecture choice."""
+    if model_type == 'attention_unet':
+        model = AttentionUNet().to(device)
+        print(f'AttentionUNet loaded: trainable ResNet34 encoder + UNet decoder with attention gates')
+    else:  # vesselnet
+        model = VesselSegNet(sam2_local_dir=sam2_local_dir).to(device)
+    return model
+
+
 def main(args):
     # MPS = Apple Silicon GPU (Metal); falls back to CPU on Intel Macs.
     device = torch.device(
@@ -63,7 +79,21 @@ def main(args):
     )
     print(f'Device: {device}')
 
-    model = VesselSegNet(sam2_local_dir=args.sam2_local_dir).to(device)
+    # Auto-detect model_type from config.yaml in checkpoint directory if available
+    model_type = args.model_type
+    seed = 42
+    ckpt_dir = os.path.dirname(args.ckpt_path)
+    config_path = os.path.join(ckpt_dir, 'config.yaml')
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+            if 'model_type' in cfg:
+                model_type = cfg['model_type']
+                print(f'Auto-detected model_type from config: {model_type}')
+            if 'seed' in cfg:
+                seed = cfg['seed']
+
+    model = create_model(model_type, device, sam2_local_dir=args.sam2_local_dir)
     model.load_state_dict(torch.load(args.ckpt_path, map_location=device))
     model.eval()
 
@@ -75,6 +105,18 @@ def main(args):
     # "test" or "trainval" in the W&B Media panel.
     splits_path = os.path.join(os.path.dirname(args.ckpt_path), "data_splits.json")
     splits_info = json.load(open(splits_path)) if os.path.exists(splits_path) else {}
+
+    # Filter to NUM_TRAINVAL_SAMPLES random train-val + NUM_TEST_SAMPLES test images
+    if splits_info:
+        trainval_paths = [p for p in img_paths if os.path.basename(p) in splits_info and splits_info[os.path.basename(p)] == "trainval"]
+        test_paths = [p for p in img_paths if os.path.basename(p) in splits_info and splits_info[os.path.basename(p)] == "test"]
+
+        random.seed(seed)
+        selected_trainval = random.sample(trainval_paths, min(NUM_TRAINVAL_SAMPLES, len(trainval_paths)))
+        selected_test = test_paths[:NUM_TEST_SAMPLES]
+
+        img_paths = sorted(selected_trainval + selected_test)
+        print(f'Filtered to: {len(selected_trainval)} train-val + {len(selected_test)} test images = {len(img_paths)} total')
 
     # Build {img_path → mask_path} lookup so we can compare predictions to ground truth.
     # load_pairs matches by leading integer ID, so it works even if filenames differ
@@ -104,10 +146,10 @@ def main(args):
         out_path = os.path.join(args.out_dir, fname)
 
         mask    = predict_image(model, img_path, device, sharp_gate=args.sharp_gate, use_focus_gate=args.use_focus_gate)
-        mask_pp = postprocess(mask)                              # cleaned: small blobs removed, holes filled, gaps closed
+        # mask_pp = postprocess(mask)                              # cleaned: small blobs removed, holes filled, gaps closed
 
-        # Save the postprocessed mask (cleaner, what you'd actually use downstream).
-        imwrite(out_path, (mask_pp.astype(np.uint8) * 255))
+        # Save raw mask (no postprocessing) to evaluate network output quality
+        imwrite(out_path, (mask.astype(np.uint8) * 255))
         print(f'  saved → {out_path}')
 
         # W&B Media panels per image: originals, prediction, gt, tp, fp, fn,
@@ -165,36 +207,25 @@ def main(args):
         cap = f"[{label}] {fname}"
         log_payload = {
             "originals":     wandb.Image(img_rgb, caption=cap),
-            "prediction":    wandb.Image(overlay(img_rgb, mask,    RED),
-                                         caption=f"{cap}  |  raw prediction"),
-            "prediction_pp": wandb.Image(overlay(img_rgb, mask_pp, RED),
-                                         caption=f"{cap}  |  postprocessed prediction"),
+            "prediction":    wandb.Image(overlay(img_rgb, mask, RED),
+                                         caption=f"{cap}  |  raw network prediction (no postprocessing)"),
         }
 
-        # If GT mask exists, log isolated TP/FP/FN panels + combined views, both
-        # for the raw mask and the postprocessed mask, so you can directly compare.
+        # If GT mask exists, log isolated TP/FP/FN panels to evaluate raw network output
         gt_path = img_to_mask.get(img_path)
         if gt_path:
             gt = imread(gt_path) > 0                          # (H, W) bool ground truth
             log_payload.update({
                 "gt":          wandb.Image(overlay(img_rgb, gt, GREEN),
                                            caption=f"{cap}  |  green = ground-truth vessel"),
-                "tp":          wandb.Image(overlay(img_rgb, mask    &  gt, GREEN),
+                "tp":          wandb.Image(overlay(img_rgb, mask  &  gt, GREEN),
                                            caption=f"{cap}  |  TP (raw)"),
-                "fp":          wandb.Image(overlay(img_rgb, mask    & ~gt, RED),
+                "fp":          wandb.Image(overlay(img_rgb, mask  & ~gt, RED),
                                            caption=f"{cap}  |  FP (raw)"),
-                "fn":          wandb.Image(overlay(img_rgb, ~mask   &  gt, CYAN),
+                "fn":          wandb.Image(overlay(img_rgb, ~mask &  gt, CYAN),
                                            caption=f"{cap}  |  FN (raw)"),
                 "combined":    wandb.Image(make_combined(mask, gt),
                                            caption=f"{cap}  |  raw  |  green=TP  red=FP  cyan=FN"),
-                "tp_pp":       wandb.Image(overlay(img_rgb, mask_pp &  gt, GREEN),
-                                           caption=f"{cap}  |  TP (postprocessed)"),
-                "fp_pp":       wandb.Image(overlay(img_rgb, mask_pp & ~gt, RED),
-                                           caption=f"{cap}  |  FP (postprocessed)"),
-                "fn_pp":       wandb.Image(overlay(img_rgb, ~mask_pp &  gt, CYAN),
-                                           caption=f"{cap}  |  FN (postprocessed)"),
-                "combined_pp": wandb.Image(make_combined(mask_pp, gt),
-                                           caption=f"{cap}  |  postprocessed  |  green=TP  red=FP  cyan=FN"),
             })
 
         wandb.log(log_payload)
@@ -208,6 +239,9 @@ if __name__ == '__main__':
     parser.add_argument('--input_dir',  required=True)
     parser.add_argument('--ckpt_path',  required=True)
     parser.add_argument('--out_dir',    default='../predictions')
+    parser.add_argument('--model_type',     default='vesselnet',
+                        choices=['vesselnet', 'attention_unet'],
+                        help='Architecture: vesselnet (SAM2 encoder + CNN decoder) or attention_unet (ResNet34 + UNet with attention gates)')
     parser.add_argument('--sharp_gate',      action='store_true')
     parser.add_argument('--use_focus_gate', action='store_true')
     parser.add_argument('--mask_dir',     default=None,

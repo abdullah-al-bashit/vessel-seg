@@ -15,7 +15,7 @@ from tqdm import tqdm
 from tifffile import imread as tif_imread
 
 from dataset import load_pairs, VesselDataset
-from model   import VesselSegNet
+from model   import VesselSegNet, AttentionUNet
 from loss    import VesselLoss
 from predict import predict_image  # full-image stitched inference for test Dice
 import wandb
@@ -103,6 +103,18 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
     n = len(loader)                                        # number of batches in the epoch
     parts = {k: v / n for k, v in total_parts.items()}    # per-sub-loss epoch averages
     return total_loss / n, parts                           # epoch-averaged total loss and sub-losses
+
+
+# ── Model factory ──────────────────────────────────────────────────────────────
+
+def create_model(model_type, device, sam2_model=None, sam2_local_dir=None):
+    """Create model based on architecture choice."""
+    if model_type == 'attention_unet':
+        model = AttentionUNet().to(device)
+        print(f'AttentionUNet created: trainable ResNet34 encoder + UNet decoder with attention gates')
+    else:  # vesselnet
+        model = VesselSegNet(sam2_model=sam2_model, sam2_local_dir=sam2_local_dir).to(device)
+    return model
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -194,7 +206,7 @@ def main(args):
                                   pin_memory=True,
                                   persistent_workers=True)
 
-        model     = VesselSegNet(sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir).to(device)
+        model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
 
         # Forward hook registered before compile so it fires on the underlying module.
         captured = {}
@@ -309,7 +321,7 @@ def main(args):
                              shuffle=False, num_workers=args.num_workers, pin_memory=True,
                              persistent_workers=True)
 
-    model = VesselSegNet(sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir).to(device)
+    model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
                                      map_location=device))
     criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
@@ -398,6 +410,9 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_coarse',   type=float, default=0.4)
     parser.add_argument('--hard_neg_factor', type=float, default=2.0)
     # ── Model ─────────────────────────────────────────────────────────────────
+    parser.add_argument('--model_type',     default='vesselnet',
+                        choices=['vesselnet', 'attention_unet'],
+                        help='Architecture: vesselnet (SAM2 encoder + CNN decoder) or attention_unet (ResNet34 + UNet with attention gates)')
     parser.add_argument('--sam2_model',     default='facebook/sam2.1-hiera-tiny')
     parser.add_argument('--sam2_local_dir', default=None,
                         help='Path to pre-downloaded SAM2 weights. If the directory exists, '
