@@ -385,7 +385,7 @@ def main(args):
                              collate_fn=collate_fn_with_filenames)
 
     model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
-    model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
+    model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, 'best_model.pth'),
                                      map_location=device))
     criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
                            lambda_boundary=args.lambda_boundary,
