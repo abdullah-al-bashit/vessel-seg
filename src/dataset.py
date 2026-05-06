@@ -173,10 +173,14 @@ class VesselDataset(Dataset):
     Each (image, mask) pair is pre-tiled; all tiles stored in memory.
     For 30 images × ~30 tiles = ~900 items.
     """
-    def __init__(self, pairs, augment=False, seed=None):
-        self.augment = augment
-        self.seed    = seed   # None → random each call; int → reproducible per idx
-        self.items   = []                        # (img_tile, msk_tile, hann)
+    def __init__(self, pairs, augment=False, seed=None,
+                 sharp_hann=True, blur_prob=0.3, blur_sigma_max=4.0):
+        self.augment        = augment
+        self.seed           = seed          # None → random each call; int → reproducible per idx
+        self.sharp_hann     = sharp_hann    # False → plain Hanning (no sharpness gate)
+        self.blur_prob      = blur_prob
+        self.blur_sigma_max = blur_sigma_max
+        self.items          = []            # (img_tile, msk_tile, hann, sharp, grad)
 
         hann = hanning_weight(TILE_H, TILE_W).astype(np.float32)
 
@@ -193,14 +197,16 @@ class VesselDataset(Dataset):
                     img_tile = _pad_tile(img_tile, TILE_H, TILE_W)
                     msk_tile = _pad_tile(msk_tile, TILE_H, TILE_W)
 
-                sharp = compute_sharpness(img_tile)              # (H, W) float32 [0,1]
-                grad  = compute_gradient_magnitude(img_tile)     # (H, W) float32 [0,1]
-                hann_sharp = hann * sharp                        # (H, W) — blurry pixels downweighted
+                sharp  = compute_sharpness(img_tile)              # (H, W) float32 [0,1]
+                grad   = compute_gradient_magnitude(img_tile)     # (H, W) float32 [0,1]
+                # sharp_hann=True: blurry pixels downweighted (model ignores blur).
+                # sharp_hann=False: plain hanning so model trains equally on blurry regions.
+                hann_w = hann * sharp if sharp_hann else hann
 
                 self.items.append((
                     img_tile.copy(),
                     msk_tile.copy(),
-                    hann_sharp.copy(),
+                    hann_w.copy(),
                     sharp.copy(),
                     grad.copy(),
                 ))
@@ -213,10 +219,13 @@ class VesselDataset(Dataset):
 
         if self.augment:
             rng = np.random.default_rng(self.seed + idx) if self.seed is not None else None
-            img, msk = _augment(img, msk, rng=rng)
+            img, msk = _augment(img, msk, rng=rng,
+                                blur_prob=self.blur_prob,
+                                blur_sigma_max=self.blur_sigma_max)
             sharp = compute_sharpness(img)
             grad  = compute_gradient_magnitude(img)
-            hann  = hann * sharp / (sharp.max() + 1e-8)  # re-weight hanning
+            if self.sharp_hann:
+                hann = hann * sharp / (sharp.max() + 1e-8)  # re-weight hanning post-augment
 
         img_t   = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
         msk_t   = torch.from_numpy(msk.astype(np.float32)).unsqueeze(0)
@@ -229,7 +238,7 @@ class VesselDataset(Dataset):
 
 # ── Augmentation ───────────────────────────────────────────────────────────────
 
-def _augment(img, msk, rng=None):
+def _augment(img, msk, rng=None, blur_prob=0.3, blur_sigma_max=4.0):
     """Geometric and intensity augmentations for vessel segmentation.
 
     rng: np.random.Generator — pass a seeded Generator for reproducibility,
@@ -289,12 +298,11 @@ def _augment(img, msk, rng=None):
         msk = map_coordinates(msk, coords, order=0, mode='reflect').astype(msk.dtype)
 
     # ── Blur augmentation ──────────────────────────────────────────────────────
-    # Randomly simulate out-of-focus regions by Gaussian-blurring the whole
-    # tile. The GT mask is unchanged — the model learns that blurry texture
-    # maps to the same (or no) vessel annotations, making it conservative in
-    # blurry regions at inference time.
-    if rng.random() > 0.7:
-        sigma_blur = rng.uniform(1.5, 4.0)
+    # Randomly simulate out-of-focus regions by Gaussian-blurring the whole tile.
+    # blur_prob / blur_sigma_max are job-level hyperparameters — higher values
+    # expose the model to more blurry examples, improving blur-region detection.
+    if rng.random() < blur_prob:
+        sigma_blur = rng.uniform(1.5, blur_sigma_max)
         img = gaussian_filter(img.astype(np.float32), sigma=sigma_blur).astype(np.uint8)
 
     # ── Intensity ──────────────────────────────────────────────────────────────

@@ -19,22 +19,13 @@ from loss    import VesselLoss
 from predict import predict_image  # full-image stitched inference for test Dice
 import wandb
 
-SEED          = 42   # single source of truth for all random seeds throughout training
-N_FOLDS       = 5    # number of cross-validation folds
-TEST_SPLIT    = 0.2  # fraction of pairs held out as final test set
-PATIENCE        = 30   # early stopping: epochs without val loss improvement before stopping
-LAMBDA_CLDICE   = 1.0  # weight of clDice — increased from 0.5; best learning signal
-LAMBDA_BOUNDARY = 0.5  # weight of sharpness boundary loss — penalises predictions crossing focus edges
-LAMBDA_COARSE = 0.4  # weight of deep-supervision loss on the pass-1 coarse mask (training only)
-                     # adds 0.4 × VesselLoss(coarse_logits, gt) so the CNN head learns to produce
-                     # clean vessel masks before the graph path refines them
-NUM_WORKERS        = 8    # DataLoader worker processes — matches --cpus-per-task=8
-GRAPH_WARMUP_EPOCHS = 10  # train CNN-only for first N epochs; graph path enabled after
+# All training hyperparameters are loaded from the YAML config file (--config).
+# See configs/exp_*.yaml for the full parameter set and documentation.
 
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
 
-def set_seed(seed=SEED):
+def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -46,7 +37,7 @@ def set_seed(seed=SEED):
 # ── One epoch ─────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
-              feat_capture=None, use_graph=None):
+              feat_capture=None, use_graph=None, lambda_coarse=0.4):
     """
     feat_capture: optional dict populated by a forward hook (see main()) that
                   holds the decoder features under key 'feats'. Passed to
@@ -78,7 +69,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
                 loss, loss_dict = criterion(logits, msk, hann, sharpness=sharp, feats=feats)
                 if train and coarse_logits is not None:
                     loss_coarse, _ = criterion(coarse_logits, msk, hann, sharpness=sharp)
-                    loss = loss + LAMBDA_COARSE * loss_coarse
+                    loss = loss + lambda_coarse * loss_coarse
                     loss_dict['coarse'] = loss_coarse.item()
                 else:
                     loss_dict['coarse'] = 0.0
@@ -108,7 +99,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(args):
-    set_seed(SEED)
+    set_seed(args.seed)
     # MPS = Apple Silicon GPU (Metal); falls back to CPU on Intel Macs.
     device = torch.device(
         'cuda' if torch.cuda.is_available()
@@ -121,31 +112,21 @@ def main(args):
     pairs = load_pairs(args.input_dir, args.output_dir)  # e.g. [('data/1_img.tif', 'data/1_msk.tif'), ('data/2_img.tif', 'data/2_msk.tif'), ...]
     print(f'Annotated pairs found: {len(pairs)}')
 
-    # Hold out 20% as a final test set — evaluated once after all CV folds,
-    # never used during training or model selection to avoid optimism bias.
-    trainval_pairs, test_pairs = train_test_split(pairs, test_size=TEST_SPLIT, random_state=SEED)
+    # Hold out test_split fraction as final test — evaluated once, never touches training.
+    trainval_pairs, test_pairs = train_test_split(pairs, test_size=args.test_split, random_state=args.seed)
     # e.g. pairs=30 → trainval_pairs=[('1_img.tif','1_msk.tif'), ...] (24 items), test_pairs=[('7_img.tif','7_msk.tif'), ...] (6 items)
     print(f'Train+val pairs: {len(trainval_pairs)}  |  Test pairs: {len(test_pairs)}')
 
     # ── W&B run — one run covers all folds + final test ───────────────────────
+    # vars(args) logs every YAML/CLI parameter so each W&B run is fully reproducible.
     wandb.init(
-        entity  = "eeebashit",
-        project = "vessel-seg",
-        config  = {
-            "seed":           SEED,
-            "n_folds":        N_FOLDS,
-            "test_split":     TEST_SPLIT,
-            "patience":       PATIENCE,
-            "lambda_cldice":   LAMBDA_CLDICE,
-            "lambda_boundary": LAMBDA_BOUNDARY,
-            "epochs":         args.epochs,
-            "batch_size":     args.batch_size,
-            "lr":             args.lr,
-        }
+        entity  = args.wandb_entity,
+        project = args.wandb_project,
+        config  = vars(args),
     )
 
-    # 5-fold CV on image-level pairs (not tile-level) to avoid data leakage
-    kf           = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)  # splitter object — actual split happens at kf.split() below
+    # n_folds-way CV on image-level pairs (not tile-level) to avoid data leakage
+    kf           = KFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)  # splitter object — actual split happens at kf.split() below
     pair_indices = list(range(len(trainval_pairs)))  # e.g. [0, 1, 2, ..., 23] for 24 trainval pairs
     best_loss_folds = []                             # best val loss per fold — used to select fold for test evaluation
 
@@ -179,28 +160,32 @@ def main(args):
         # the other 4/5 become train_idx — e.g. fold 0: val_idx=[0..4], train_idx=[5..23]
 
         # reset RNG so every fold's model starts from the same weight initialisation
-        set_seed(SEED + fold)
-        print(f'\n═══ Fold {fold+1}/{N_FOLDS} ═══')
+        set_seed(args.seed + fold)
+        print(f'\n═══ Fold {fold+1}/{args.n_folds} ═══')
 
         # map integer indices back to actual (img_path, msk_path) tuples
         train_pairs = [trainval_pairs[i] for i in train_idx]  # e.g. 19 pairs
         val_pairs   = [trainval_pairs[i] for i in val_idx]    # e.g. 5 pairs
 
         # tile each pair; train set gets augmentation, val set does not
-        train_ds = VesselDataset(train_pairs, augment=True,  seed=SEED)
-        val_ds   = VesselDataset(val_pairs,   augment=False, seed=SEED)
+        train_ds = VesselDataset(train_pairs, augment=True,  seed=args.seed,
+                                 sharp_hann=not args.plain_hann,
+                                 blur_prob=args.blur_prob,
+                                 blur_sigma_max=args.blur_sigma_max)
+        val_ds   = VesselDataset(val_pairs,   augment=False, seed=args.seed,
+                                 sharp_hann=not args.plain_hann)
         print(f'  Train tiles: {len(train_ds)}  |  Val tiles: {len(val_ds)}')
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                  shuffle=True,  num_workers=NUM_WORKERS,
+                                  shuffle=True,  num_workers=args.num_workers,
                                   pin_memory=True,         # allocates batches in CPU memory that the GPU can read directly, avoiding an extra copy
                                   persistent_workers=True) # keeps worker processes alive between epochs so they don't need to be spawned again each epoch
         val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                                  shuffle=False, num_workers=NUM_WORKERS,
+                                  shuffle=False, num_workers=args.num_workers,
                                   pin_memory=True,
                                   persistent_workers=True)
 
-        model     = VesselSegNet().to(device)
+        model     = VesselSegNet(sam2_model=args.sam2_model).to(device)
 
         # Forward hook registered before compile so it fires on the underlying module.
         captured = {}
@@ -208,7 +193,10 @@ def main(args):
             captured['feats'] = inputs[0]
         feat_hook = model.head.register_forward_hook(_capture_features)  # removed at end of fold
 
-        criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE, lambda_boundary=LAMBDA_BOUNDARY)
+        criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
+                               lambda_boundary=args.lambda_boundary,
+                               lambda_contrast=args.lambda_contrast,
+                               hard_neg_factor=args.hard_neg_factor)
         scaler    = GradScaler() if device.type == 'cuda' else None
 
         # Only train decoder + graph net — encoder is frozen inside model
@@ -221,18 +209,18 @@ def main(args):
         no_improve = 0             # counter — resets to 0 whenever val loss improves, increments otherwise
 
         for epoch in range(1, args.epochs + 1):
-            train_ds.seed = SEED + epoch  # vary augmentations each epoch
+            train_ds.seed = args.seed + epoch  # vary augmentations each epoch
 
-            # Graph path is expensive (skeletonize + GNN per batch); skip it for the first
-            # GRAPH_WARMUP_EPOCHS so the CNN head converges before graph refinement kicks in.
-            use_graph = (epoch > GRAPH_WARMUP_EPOCHS)
+            # CNN-only: graph path is slower and does not improve val Dice over pure CNN.
+            use_graph = False
 
             # Wall-clock per-phase timing — used for accurate runtime estimation
             t_train_start = time.perf_counter()
             tr_loss, tr_parts = run_epoch(model, train_loader, criterion,
                                           optimizer, scaler, device, train=True,
                                           use_graph=use_graph,
-                                          feat_capture=captured)   # contrastive loss uses these
+                                          feat_capture=captured,
+                                          lambda_coarse=args.lambda_coarse)
             t_train = time.perf_counter() - t_train_start
 
             t_val_start = time.perf_counter()
@@ -284,7 +272,7 @@ def main(args):
                 wandb.log_artifact(artifact)
             else:
                 no_improve += 1
-                if no_improve >= PATIENCE:
+                if no_improve >= args.patience:
                     print(f'  Early stopping at epoch {epoch}')
                     break
 
@@ -293,24 +281,28 @@ def main(args):
         wandb.log({f"fold{fold+1}/best_val_loss": best_loss})
         feat_hook.remove()  # detach the forward hook before next fold rebuilds the model
 
-    print(f'\n5-fold CV val loss: {np.mean(best_loss_folds):.4f} '
+    print(f'\n{args.n_folds}-fold CV val loss: {np.mean(best_loss_folds):.4f} '
           f'± {np.std(best_loss_folds):.4f}')
 
     # ── Final test evaluation ──────────────────────────────────────────────────
     # Load the fold with the lowest val loss and evaluate once on the held-out test set.
     best_fold = int(np.argmin(best_loss_folds)) + 1
     print(f'\nEvaluating fold {best_fold} (lowest val loss) on held-out test set ...')
-    set_seed(SEED)
+    set_seed(args.seed)
 
-    test_ds     = VesselDataset(test_pairs, augment=False, seed=SEED)
+    test_ds     = VesselDataset(test_pairs, augment=False, seed=args.seed,
+                                sharp_hann=not args.plain_hann)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size,
-                             shuffle=False, num_workers=NUM_WORKERS, pin_memory=True,
+                             shuffle=False, num_workers=args.num_workers, pin_memory=True,
                              persistent_workers=True)
 
-    model = VesselSegNet().to(device)
+    model = VesselSegNet(sam2_model=args.sam2_model).to(device)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
                                      map_location=device))
-    criterion = VesselLoss(lambda_cldice=LAMBDA_CLDICE, lambda_boundary=LAMBDA_BOUNDARY)
+    criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
+                           lambda_boundary=args.lambda_boundary,
+                           lambda_contrast=args.lambda_contrast,
+                           hard_neg_factor=args.hard_neg_factor)
 
     te_loss, te_parts = run_epoch(model, test_loader, criterion,
                                    None, None, device, train=False)
@@ -351,15 +343,57 @@ def main(args):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    import yaml
+
+    # Two-pass parse: first read --config path, load YAML, then set those values
+    # as argparse defaults so any explicit CLI flag still overrides the config.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config', default=None)
+    pre_args, _ = pre.parse_known_args()
+
+    cfg = {}
+    if pre_args.config:
+        with open(pre_args.config) as f:
+            cfg = yaml.safe_load(f) or {}
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_dir',  required=True)
-    parser.add_argument('--output_dir', required=True)
-    parser.add_argument('--ckpt_dir',   default='../checkpoints')
-    parser.add_argument('--epochs',     type=int, default=200)
-    parser.add_argument('--folds',      type=int, default=N_FOLDS,
-                        help='Train at most this many folds (still uses 5-way 80/20 split)')
-    parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--lr',         type=float, default=1e-4)
+    # ── Paths (cluster-specific; always set via CLI or submit.sh) ─────────────
+    parser.add_argument('--config',       default=None,  help='Path to YAML experiment config')
+    parser.add_argument('--input_dir',    required=True)
+    parser.add_argument('--output_dir',   required=True)
+    parser.add_argument('--ckpt_dir',     default='../checkpoints')
+    # ── W&B ───────────────────────────────────────────────────────────────────
+    parser.add_argument('--wandb_entity',  default='eeebashit')
+    parser.add_argument('--wandb_project', default='vessel-seg')
+    # ── Reproducibility ───────────────────────────────────────────────────────
+    parser.add_argument('--seed',         type=int,   default=42)
+    # ── Cross-validation ──────────────────────────────────────────────────────
+    parser.add_argument('--n_folds',      type=int,   default=5)
+    parser.add_argument('--test_split',   type=float, default=0.2)
+    parser.add_argument('--folds',        type=int,   default=5,
+                        help='Train at most this many folds (still uses n_folds-way 80/20 split)')
+    parser.add_argument('--patience',     type=int,   default=30)
+    # ── Training loop ─────────────────────────────────────────────────────────
+    parser.add_argument('--epochs',       type=int,   default=200)
+    parser.add_argument('--batch_size',   type=int,   default=2)
+    parser.add_argument('--lr',           type=float, default=1e-4)
+    parser.add_argument('--num_workers',  type=int,   default=8)
+    # ── Loss weights ──────────────────────────────────────────────────────────
+    parser.add_argument('--lambda_cldice',   type=float, default=1.0)
+    parser.add_argument('--lambda_boundary', type=float, default=0.5)
+    parser.add_argument('--lambda_contrast', type=float, default=0.1)
+    parser.add_argument('--lambda_coarse',   type=float, default=0.4)
+    parser.add_argument('--hard_neg_factor', type=float, default=2.0)
+    # ── Model ─────────────────────────────────────────────────────────────────
+    parser.add_argument('--sam2_model',   default='facebook/sam2.1-hiera-tiny')
+    # ── Dataset / augmentation ────────────────────────────────────────────────
+    parser.add_argument('--plain_hann',     action='store_true')
+    parser.add_argument('--blur_prob',      type=float, default=0.3)
+    parser.add_argument('--blur_sigma_max', type=float, default=4.0)
+    # YAML config values become defaults; explicit CLI flags still override.
+    # Exclude path args — those are always cluster-specific and set via CLI.
+    parser.set_defaults(**{k: v for k, v in cfg.items()
+                           if k not in ('input_dir', 'output_dir', 'ckpt_dir')})
     args = parser.parse_args()
 
     os.makedirs(args.ckpt_dir, exist_ok=True)

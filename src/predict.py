@@ -43,7 +43,7 @@ def predict_image(model, img_path, device):
             grad    = compute_gradient_magnitude(img_tile)
             sharp_t = torch.from_numpy(sharp).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
             grad_t  = torch.from_numpy(grad).unsqueeze(0).unsqueeze(0).to(device)   # (1,1,H,W)
-            logits, _ = model(t, use_graph=True, sharpness=sharp_t, grad_mag=grad_t)
+            logits, _ = model(t, use_graph=False, sharpness=sharp_t, grad_mag=grad_t)
             prob   = torch.sigmoid(logits).squeeze().cpu().numpy()  # (H, W)
             tile_probs.append(prob)
             tile_xs.append(x_off)

@@ -1,0 +1,49 @@
+# Experiment A: CNN-only baseline
+# Goal: clean reference run — no blur-handling changes, sharpness gate ON
+
+# ── W&B logging (train.py → wandb.init) ───────────────────────────────────────
+wandb_entity:  "eeebashit"   # train.py wandb.init(entity=wandb_entity)
+wandb_project: "vessel-seg"  # train.py wandb.init(project=wandb_project)
+
+# ── Reproducibility (train.py → set_seed) ─────────────────────────────────────
+seed: 42                     # train.py set_seed(seed) → random / numpy / torch / cuda seeds
+
+# ── Cross-validation (train.py → KFold, train_test_split) ────────────────────
+n_folds:    5                # train.py KFold(n_splits=n_folds) — total folds in the CV split
+test_split: 0.2              # train.py train_test_split(test_size=test_split) — held-out test fraction
+folds:      1                # train.py: stop after this many folds (1 = one 80/20 fold, fits ~8 h budget)
+patience:   30               # train.py: early-stop after this many epochs without val loss improvement
+
+# ── Training loop (train.py → DataLoader, AdamW, scheduler) ──────────────────
+epochs:      200             # train.py range(1, epochs+1); early stopping usually fires before 200
+batch_size:  8               # train.py DataLoader(batch_size=batch_size)
+lr:          0.0001          # train.py AdamW(lr=lr)
+num_workers: 8               # train.py DataLoader(num_workers=num_workers) — match SBATCH --cpus-per-task
+
+# ── Loss weights (train.py → loss.py VesselLoss) ─────────────────────────────
+# VesselLoss = Dice + BCE_hard_neg + λ_cl*clDice + λ_bd*boundary + λ_ct*contrastive
+lambda_cldice:   1.0         # loss.py VesselLoss(lambda_cldice=...) → weight on cldice_loss (topology)
+lambda_boundary: 0.5         # loss.py VesselLoss(lambda_boundary=...) → weight on sharpness_boundary_loss
+lambda_contrast: 0.1         # loss.py VesselLoss(lambda_contrast=...) → weight on prototype_contrastive_loss
+lambda_coarse:   0.4         # train.py run_epoch: LAMBDA_COARSE * VesselLoss(coarse_logits, gt)
+                             #   (currently inactive — graph path is disabled, coarse_logits is always None)
+hard_neg_factor: 2.0         # loss.py bce_loss_hard_neg(hard_neg_factor=...) — peak weight boost on confident FP background pixels
+
+# ── Model architecture (model.py → VesselSegNet → SAM2Encoder) ───────────────
+sam2_model: "facebook/sam2.1-hiera-tiny"
+                             # model.py SAM2Encoder(hf_model_id=sam2_model) → from_pretrained(...)
+                             # options: sam2.1-hiera-{tiny, small, base-plus, large}
+                             # tiny: ~38 M params encoder, ~2.5 min/epoch (fastest)
+                             # small: ~46 M, slightly better features
+                             # base-plus: ~80 M, stronger but ~2× slower
+                             # large: ~308 M, best quality, ~4× slower
+
+# ── Loss weighting gate (train.py → VesselDataset(sharp_hann = not plain_hann)) ─
+plain_hann: false            # false → sharp_hann=True: Hanning × sharpness map
+                             #   blurry pixels get lower loss weight → model ignores blurry regions
+                             # true  → sharp_hann=False: plain Hanning
+                             #   model trains equally on blurry regions → better blur detection
+
+# ── Blur augmentation (train.py → VesselDataset → dataset.py _augment()) ──────
+blur_prob:      0.3          # dataset.py _augment(): if rng.random() < blur_prob → apply gaussian_filter
+blur_sigma_max: 4.0          # dataset.py _augment(): sigma ~ Uniform(1.5, blur_sigma_max) for gaussian_filter

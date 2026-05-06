@@ -37,23 +37,46 @@ echo "Start:     $(date)"
 # ── Paths ──────────────────────────────────────────────────────────────────────
 INPUT_DIR="data/images"
 OUTPUT_DIR="data/masks"
-CKPT_DIR="checkpoints"
+
+# Job-specific checkpoint dir — each run gets its own folder so concurrent or
+# sequential submits never overwrite each other's best model.
+CKPT_DIR="checkpoints/$SLURM_JOB_ID"
+mkdir -p $CKPT_DIR
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+# Set CONFIG when submitting to pick the experiment YAML.
+# All hyperparameters (epochs, lr, loss weights, blur aug, sam2_model, …) live
+# in the YAML file — this script only handles cluster-specific paths.
+#
+# Submit all 4 experiments:
+#   sbatch scripts/submit.sh                                          # A: baseline
+#   sbatch --export=ALL,CONFIG=configs/exp_B.yaml scripts/submit.sh  # B: plain hann
+#   sbatch --export=ALL,CONFIG=configs/exp_C.yaml scripts/submit.sh  # C: more blur
+#   sbatch --export=ALL,CONFIG=configs/exp_D.yaml scripts/submit.sh  # D: both
+CONFIG="${CONFIG:-configs/exp_A.yaml}"
+
+# Copy config into checkpoint dir so the run is self-documenting — inspecting
+# checkpoints/<job_id>/config.yaml tells you exactly what was run.
+cp $CONFIG $CKPT_DIR/config.yaml
+
+echo "Config:    $CONFIG"
+echo "CKPT_DIR:  $CKPT_DIR"
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 python src/train.py \
-    --input_dir   $INPUT_DIR  \
-    --output_dir  $OUTPUT_DIR \
-    --ckpt_dir    $CKPT_DIR   \
-    --folds       1           \
-    --epochs      50          \
-    --batch_size  8           \
-    --lr          1e-4
+    --config     $CONFIG    \
+    --input_dir  $INPUT_DIR \
+    --output_dir $OUTPUT_DIR \
+    --ckpt_dir   $CKPT_DIR
 
 echo "Training done: $(date)"
 
 # ── Submit predict as a separate job dependent on this job's success ───────────
-# --dependency=afterok:$SLURM_JOB_ID ensures the predict job only starts once
-# this training job exits with status 0 (success). If training fails or is
-# cancelled, the predict job is automatically held and never runs.
-PREDICT_JOB=$(sbatch --parsable --dependency=afterok:$SLURM_JOB_ID scripts/submit_predict.sh)
-echo "Predict job submitted: $PREDICT_JOB  (runs after this job exits)"
+# --dependency=afterok:$SLURM_JOB_ID ensures predict only starts after successful exit.
+# CKPT_PATH is passed via --export so predict.py uses this run's checkpoint, not
+# a hardcoded path that could point to a different run's model.
+PREDICT_JOB=$(sbatch --parsable \
+    --dependency=afterok:$SLURM_JOB_ID \
+    --export=ALL,CKPT_PATH=$CKPT_DIR/fold1_best.pth \
+    scripts/submit_predict.sh)
+echo "Predict job submitted: $PREDICT_JOB  (ckpt: $CKPT_DIR/fold1_best.pth)"

@@ -10,9 +10,8 @@ import skan                                              # skeleton → graph; r
                                                           # (sknw issue #1: out-of-bounds writes in fill/trace buf on 1024+px inputs)
 from scipy.ndimage import distance_transform_edt         # vessel radius map; one module-level import avoids re-importing on every forward pass
 
-HF_MODEL_ID = "facebook/sam2.1-hiera-tiny"              # SAM2.1 Hiera-Tiny — smallest variant (~38M params encoder)
-                                                         # ~5–8× faster than Hiera-Large, slight Dice cost.
-                                                         # Other options: sam2.1-hiera-{tiny,small,base-plus,large}
+HF_MODEL_ID = "facebook/sam2.1-hiera-tiny"  # default; overridden per-experiment via config sam2_model
+                                            # options: sam2.1-hiera-{tiny,small,base-plus,large}
 
 # ── Feature dimensions ─────────────────────────────────────────────────────────
 # Node features (39 total):
@@ -59,12 +58,12 @@ class SAM2Encoder(nn.Module):
     (e.g. H/4, H/8, H/16, H/32) so both fine detail and broad context are captured.
     feats[0] is the finest (highest resolution), feats[3] is the coarsest.
     """
-    def __init__(self):
+    def __init__(self, hf_model_id=HF_MODEL_ID):
         super().__init__()
         from transformers import Sam2Model, Sam2Processor  # lazy import — avoids load at module level
 
-        self.processor = Sam2Processor.from_pretrained(HF_MODEL_ID)  # handles image pre-processing (resize, normalize, pad)
-        self.sam2      = Sam2Model.from_pretrained(HF_MODEL_ID)       # full SAM2 model (encoder + prompt + decoder)
+        self.processor = Sam2Processor.from_pretrained(hf_model_id)  # handles image pre-processing (resize, normalize, pad)
+        self.sam2      = Sam2Model.from_pretrained(hf_model_id)       # full SAM2 model (encoder + prompt + decoder)
 
         # Freeze entire vision encoder — Hiera ViT weights never updated during training
         for name, p in self.sam2.named_parameters():
@@ -1110,9 +1109,9 @@ class VesselSegNet(nn.Module):
                         head Conv1×1
                         (B,1,H,W) logits
     """
-    def __init__(self):
+    def __init__(self, sam2_model=HF_MODEL_ID):
         super().__init__()
-        self.encoder   = SAM2Encoder()                                          # frozen Hiera ViT-L
+        self.encoder   = SAM2Encoder(hf_model_id=sam2_model)                   # frozen Hiera ViT-L
         self.cnn_dec   = CNNDecoder(in_ch=256)                                  # (B,256,H/4,W/4)→(B,32,H,W)
         self.graph_net = VesselGraphNet(in_ch=NODE_FEAT_DIM, hidden=64,         # (N,39)→(N,64)
                                         out_ch=64, K=10)
