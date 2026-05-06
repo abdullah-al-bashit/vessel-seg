@@ -39,7 +39,10 @@ sam2_model: "facebook/sam2.1-hiera-tiny"
                              # large: ~308 M, best quality, ~4× slower
 
 # ── Loss weighting gate (train.py → VesselDataset(sharp_hann = not plain_hann)) ─
-plain_hann: false            # false → sharp_hann=True: Hanning × sharpness map
+plain_hann: false
+sharp_gate: false            # false → no feature gating (baseline)
+use_focus_gate: false
+lambda_focus: 0.5            # false → sharp_hann=True: Hanning × sharpness map
                              #   blurry pixels get lower loss weight → model ignores blurry regions
                              # true  → sharp_hann=False: plain Hanning
                              #   model trains equally on blurry regions → better blur detection

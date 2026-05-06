@@ -1116,9 +1116,15 @@ class VesselSegNet(nn.Module):
         self.graph_net = VesselGraphNet(in_ch=NODE_FEAT_DIM, hidden=64,         # (N,39)→(N,64)
                                         out_ch=64, K=10)
         self.fuse_proj = nn.Conv2d(32 + 64, 32, kernel_size=1)                 # (B,96,H,W)→(B,32,H,W)
-        self.head      = nn.Conv2d(32, 1, kernel_size=1)                        # (B,32,H,W)→(B,1,H,W)
+        self.head       = nn.Conv2d(32, 1, kernel_size=1)                       # (B,32,H,W)→(B,1,H,W)
+        self.focus_head = nn.Conv2d(32, 1, kernel_size=1)                       # predicts in-focus map ∈ (0,1)
+        # Per-channel learnable sharpness gate: gate = sigmoid(scale * sharpness + bias)
+        # scale init=1, bias init=0 → starts as sigmoid(sharpness); bias shifts positive
+        # during training to prevent full feature suppression in blurry regions.
+        self.sharp_gate_scale = nn.Parameter(torch.ones(32))                    # (32,) per decoder channel
+        self.sharp_gate_bias  = nn.Parameter(torch.zeros(32))                   # (32,) per decoder channel
 
-    def forward(self, x, use_graph=True, sharpness=None, grad_mag=None):
+    def forward(self, x, use_graph=True, sharpness=None, grad_mag=None, sharp_gate=False, use_focus_gate=False):
         """
         Standard two-pass self-feedback forward for graph-augmented segmentation.
 
@@ -1155,6 +1161,24 @@ class VesselSegNet(nn.Module):
             x_enc = x
         feats   = self.encoder(x_enc)
         F_pixel = self.cnn_dec(feats)             # (B, 32, H_sam, W_sam) ≈ (B, 32, 1024, 1024)
+
+        # Learnable per-channel sharpness gate.
+        # gate = sigmoid(scale * s + bias) — shape (B, 32, H, W)
+        # bias is learned to go positive, keeping gate > 0.5 even in blurry regions.
+        if sharp_gate and sharpness is not None:
+            s    = F.interpolate(sharpness, size=F_pixel.shape[2:], mode='bilinear', align_corners=False)
+            gate = torch.sigmoid(
+                self.sharp_gate_scale[None, :, None, None] * s +
+                self.sharp_gate_bias[None,  :, None, None]
+            )
+            F_pixel = F_pixel * gate
+
+        # Focus gate: learn to predict in-focus vs blurry pixels from features.
+        # Supervised by the VoL sharpness map — more robust than using raw VoL directly.
+        focus_logits = None
+        if use_focus_gate:
+            focus_logits = self.focus_head(F_pixel)                             # (B,1,H,W) logits
+            F_pixel = F_pixel * torch.sigmoid(focus_logits)                     # gate features by learned focus
 
         if not use_graph:
             # CNN-only path (used for ablation studies or when graph is disabled).
@@ -1236,4 +1260,4 @@ class VesselSegNet(nn.Module):
             coarse_logits = F.interpolate(coarse_logits, size=(H_in, W_in),
                                           mode='bilinear', align_corners=False)
 
-        return logits, coarse_logits
+        return logits, coarse_logits, focus_logits

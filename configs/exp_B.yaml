@@ -33,6 +33,9 @@ sam2_model: "facebook/sam2.1-hiera-tiny"
 
 # ── Loss weighting gate (train.py → VesselDataset(sharp_hann = not plain_hann)) ─
 plain_hann: true             # true → sharp_hann=False: plain Hanning, no sharpness gate
+sharp_gate: true             # true → multiply decoder features by sharpness map before head
+use_focus_gate: false
+lambda_focus: 0.5
                              #   model trains equally on blurry regions → detects blur-region vessels
                              #   (exp_A uses false = sharpness-gated Hanning)
 

@@ -33,6 +33,9 @@ sam2_model: "facebook/sam2.1-hiera-tiny"
 
 # ── Loss weighting gate (train.py → VesselDataset(sharp_hann = not plain_hann)) ─
 plain_hann: false            # same as exp_A — isolates the blur aug effect
+sharp_gate: false
+use_focus_gate: true         # true → learned focus head gates decoder features
+lambda_focus: 0.5
 
 # ── Blur augmentation (train.py → VesselDataset → dataset.py _augment()) ──────
 blur_prob:      0.6          # 60% of tiles get blur aug (vs 30% in exp_A/B)

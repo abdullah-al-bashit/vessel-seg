@@ -63,11 +63,14 @@ echo "Config:    $CONFIG"
 echo "CKPT_DIR:  $CKPT_DIR"
 
 # ── Train ─────────────────────────────────────────────────────────────────────
+# EPOCHS env var overrides the config value — useful for quick timing tests:
+#   sbatch --export=ALL,EPOCHS=1 scripts/submit.sh
 python src/train.py \
     --config     $CONFIG    \
     --input_dir  $INPUT_DIR \
     --output_dir $OUTPUT_DIR \
-    --ckpt_dir   $CKPT_DIR
+    --ckpt_dir   $CKPT_DIR  \
+    ${EPOCHS:+--epochs $EPOCHS}
 
 echo "Training done: $(date)"
 

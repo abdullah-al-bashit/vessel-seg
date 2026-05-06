@@ -33,6 +33,9 @@ sam2_model: "facebook/sam2.1-hiera-tiny"
 
 # ── Loss weighting gate (train.py → VesselDataset(sharp_hann = not plain_hann)) ─
 plain_hann: true             # true → plain Hanning; model trains on blurry regions (from exp_B)
+sharp_gate: false
+use_focus_gate: false
+lambda_focus: 0.5
 
 # ── Blur augmentation (train.py → VesselDataset → dataset.py _augment()) ──────
 blur_prob:      0.6          # 60% blur prob (from exp_C)

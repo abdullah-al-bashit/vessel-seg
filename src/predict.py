@@ -43,7 +43,7 @@ def predict_image(model, img_path, device):
             grad    = compute_gradient_magnitude(img_tile)
             sharp_t = torch.from_numpy(sharp).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
             grad_t  = torch.from_numpy(grad).unsqueeze(0).unsqueeze(0).to(device)   # (1,1,H,W)
-            logits, _ = model(t, use_graph=False, sharpness=sharp_t, grad_mag=grad_t)
+            logits, _, _ = model(t, use_graph=False, sharpness=sharp_t, grad_mag=grad_t, sharp_gate=args.sharp_gate, use_focus_gate=args.use_focus_gate)
             prob   = torch.sigmoid(logits).squeeze().cpu().numpy()  # (H, W)
             tile_probs.append(prob)
             tile_xs.append(x_off)
@@ -208,6 +208,8 @@ if __name__ == '__main__':
     parser.add_argument('--input_dir',  required=True)
     parser.add_argument('--ckpt_path',  required=True)
     parser.add_argument('--out_dir',    default='../predictions')
+    parser.add_argument('--sharp_gate',      action='store_true')
+    parser.add_argument('--use_focus_gate', action='store_true')
     parser.add_argument('--mask_dir',   default=None,
                         help='Optional ground-truth mask folder. If given, log a per-image '
                              'TP/FP/FN error map (green/red/yellow) alongside the prediction.')

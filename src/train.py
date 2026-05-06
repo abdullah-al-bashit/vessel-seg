@@ -6,6 +6,7 @@ import random  # used in set_seed
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from sklearn.model_selection import KFold, train_test_split
@@ -37,7 +38,8 @@ def set_seed(seed=42):
 # ── One epoch ─────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
-              feat_capture=None, use_graph=None, lambda_coarse=0.4):
+              feat_capture=None, use_graph=None, lambda_coarse=0.4,
+              use_focus_gate=False, lambda_focus=0.5):
     """
     feat_capture: optional dict populated by a forward hook (see main()) that
                   holds the decoder features under key 'feats'. Passed to
@@ -48,7 +50,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
         use_graph = train  # default: graph during training, disabled during val
     model.train(train)
     total_loss  = 0.0
-    total_parts = {'dice': 0.0, 'bce': 0.0, 'cldice': 0.0, 'boundary': 0.0, 'contrast': 0.0, 'coarse': 0.0}
+    total_parts = {'dice': 0.0, 'bce': 0.0, 'cldice': 0.0, 'boundary': 0.0, 'contrast': 0.0, 'coarse': 0.0, 'focus': 0.0}
 
     use_amp = device.type == 'cuda'
     # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
@@ -62,9 +64,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
             grad  = grad.to(device)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                logits, coarse_logits = model(img, use_graph=use_graph, sharpness=sharp, grad_mag=grad)
-                # Pass captured features to criterion only during training; val
-                # / test gets feats=None so contrastive is skipped.
+                logits, coarse_logits, focus_logits = model(img, use_graph=use_graph, sharpness=sharp, grad_mag=grad, sharp_gate=args.sharp_gate, use_focus_gate=use_focus_gate)
                 feats  = feat_capture.get('feats') if (train and feat_capture is not None) else None
                 loss, loss_dict = criterion(logits, msk, hann, sharpness=sharp, feats=feats)
                 if train and coarse_logits is not None:
@@ -73,6 +73,15 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
                     loss_dict['coarse'] = loss_coarse.item()
                 else:
                     loss_dict['coarse'] = 0.0
+                # Focus head loss: teach it to predict in-focus vs blurry regions.
+                # Supervised by the VoL sharpness map resized to feature resolution.
+                if focus_logits is not None and sharp is not None:
+                    s = F.interpolate(sharp, size=focus_logits.shape[2:], mode='bilinear', align_corners=False)
+                    focus_loss = F.binary_cross_entropy_with_logits(focus_logits, s)
+                    loss = loss + lambda_focus * focus_loss
+                    loss_dict['focus'] = focus_loss.item()
+                else:
+                    loss_dict['focus'] = 0.0
 
             if train:
                 optimizer.zero_grad()
@@ -220,7 +229,9 @@ def main(args):
                                           optimizer, scaler, device, train=True,
                                           use_graph=use_graph,
                                           feat_capture=captured,
-                                          lambda_coarse=args.lambda_coarse)
+                                          lambda_coarse=args.lambda_coarse,
+                                          use_focus_gate=args.use_focus_gate,
+                                          lambda_focus=args.lambda_focus)
             t_train = time.perf_counter() - t_train_start
 
             t_val_start = time.perf_counter()
@@ -248,6 +259,7 @@ def main(args):
                 f"fold{fold+1}/train_boundary":  tr_parts["boundary"],
                 f"fold{fold+1}/train_contrast":  tr_parts["contrast"],
                 f"fold{fold+1}/train_coarse":    tr_parts["coarse"],
+                f"fold{fold+1}/train_focus":     tr_parts["focus"],
                 f"fold{fold+1}/val_loss":        va_loss,
                 f"fold{fold+1}/val_dice":        va_parts["dice"],
                 f"fold{fold+1}/val_bce":         va_parts["bce"],
@@ -388,6 +400,12 @@ if __name__ == '__main__':
     parser.add_argument('--sam2_model',   default='facebook/sam2.1-hiera-tiny')
     # ── Dataset / augmentation ────────────────────────────────────────────────
     parser.add_argument('--plain_hann',     action='store_true')
+    parser.add_argument('--sharp_gate',      action='store_true',
+                        help='Multiply decoder features by sharpness map before head — suppresses blurry predictions.')
+    parser.add_argument('--use_focus_gate', action='store_true',
+                        help='Learn an in-focus prediction head; gate decoder features by predicted focus map.')
+    parser.add_argument('--lambda_focus',   type=float, default=0.5,
+                        help='Weight on the focus head BCE loss.')
     parser.add_argument('--blur_prob',      type=float, default=0.3)
     parser.add_argument('--blur_sigma_max', type=float, default=4.0)
     # YAML config values become defaults; explicit CLI flags still override.
