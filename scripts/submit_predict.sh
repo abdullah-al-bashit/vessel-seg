@@ -20,6 +20,14 @@ module load anaconda3/2024.06
 
 source activate pytorch_env
 
+# ── Guard against numpy/scikit-image binary incompatibility ───────────────────
+# Different nodes on Explorer can load different CUDA stacks, producing a numpy
+# mismatch. Reinstall scikit-image against the active numpy if the import fails.
+python -c "from skimage.transform import resize" 2>/dev/null || {
+    echo "scikit-image binary incompatible with current numpy — reinstalling..."
+    pip install --force-reinstall scikit-image -q
+}
+
 # ── HuggingFace cache → scratch (more space than home) ────────────────────────
 export HF_HOME=/scratch/$USER/.cache/huggingface
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

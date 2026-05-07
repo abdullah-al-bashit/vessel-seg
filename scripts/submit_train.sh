@@ -44,19 +44,7 @@ CKPT_DIR="checkpoints/$SLURM_JOB_ID"
 mkdir -p $CKPT_DIR
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# Set CONFIG when submitting to pick the experiment YAML.
-# All hyperparameters (epochs, lr, loss weights, blur aug, sam2_model, …) live
-# in the YAML file — this script only handles cluster-specific paths.
-#
-# Current default: exp_E (AttentionUNet)
-#   sbatch scripts/submit.sh                  # runs exp_E (AttentionUNet)
-#
-# Other experiments (commented out):
-#   # sbatch --export=ALL,CONFIG=configs/exp_A.yaml scripts/submit.sh  # A: base-plus SAM2 encoder
-#   # sbatch --export=ALL,CONFIG=configs/exp_B.yaml scripts/submit.sh  # B: plain hann + learnable sharp gate
-#   # sbatch --export=ALL,CONFIG=configs/exp_C.yaml scripts/submit.sh  # C: aggressive blur + focus head
-#   # sbatch --export=ALL,CONFIG=configs/exp_D.yaml scripts/submit.sh  # D: plain hann + aggressive blur
-CONFIG="${CONFIG:-configs/exp_E.yaml}"
+CONFIG="${CONFIG:-configs/config.yaml}"
 
 # Copy config into checkpoint dir so the run is self-documenting — inspecting
 # checkpoints/<job_id>/config.yaml tells you exactly what was run.
@@ -67,8 +55,8 @@ echo "CKPT_DIR:  $CKPT_DIR"
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 # Environment vars override config values — useful for quick tests and GPU optimization:
-#   sbatch --export=ALL,EPOCHS=1 scripts/submit.sh
-#   sbatch --export=ALL,BATCH_SIZE=96,NUM_WORKERS=32 scripts/submit.sh
+#   sbatch --export=ALL,EPOCHS=1 scripts/submit_train.sh
+#   sbatch --export=ALL,BATCH_SIZE=96,NUM_WORKERS=32 scripts/submit_train.sh
 python src/train.py \
     --config     $CONFIG    \
     --input_dir  $INPUT_DIR \

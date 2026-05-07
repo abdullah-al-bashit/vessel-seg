@@ -10,7 +10,7 @@ from tifffile import imread, imwrite
 from tqdm import tqdm
 
 from dataset     import normalize, tile_image, stitch_tiles, load_pairs, compute_sharpness, compute_gradient_magnitude
-from model       import VesselSegNet, AttentionUNet, visualize_attention_maps
+from model       import AttentionUNet, visualize_attention_maps
 from postprocess import postprocess           # rule-based mask cleanup
 import wandb
 
@@ -60,13 +60,9 @@ def predict_image(model, img_path, device, sharp_gate=False, use_focus_gate=Fals
     return mask
 
 
-def create_model(model_type, device, sam2_local_dir=None):
-    """Create model based on architecture choice."""
-    if model_type == 'attention_unet':
-        model = AttentionUNet().to(device)
-        print(f'AttentionUNet loaded: trainable ResNet34 encoder + UNet decoder with attention gates')
-    else:  # vesselnet
-        model = VesselSegNet(sam2_local_dir=sam2_local_dir).to(device)
+def create_model(device):
+    model = AttentionUNet().to(device)
+    print(f'AttentionUNet loaded: trainable ResNet34 encoder + UNet decoder with attention gates')
     return model
 
 
@@ -79,21 +75,15 @@ def main(args):
     )
     print(f'Device: {device}')
 
-    # Auto-detect model_type from config.yaml in checkpoint directory if available
-    model_type = args.model_type
     seed = 42
-    ckpt_dir = os.path.dirname(args.ckpt_path)
-    config_path = os.path.join(ckpt_dir, 'config.yaml')
+    config_path = os.path.join(os.path.dirname(args.ckpt_path), 'config.yaml')
     if os.path.exists(config_path):
         with open(config_path) as f:
             cfg = yaml.safe_load(f) or {}
-            if 'model_type' in cfg:
-                model_type = cfg['model_type']
-                print(f'Auto-detected model_type from config: {model_type}')
             if 'seed' in cfg:
                 seed = cfg['seed']
 
-    model = create_model(model_type, device, sam2_local_dir=args.sam2_local_dir)
+    model = create_model(device)
     model.load_state_dict(torch.load(args.ckpt_path, map_location=device))
     model.eval()
 
@@ -246,16 +236,10 @@ if __name__ == '__main__':
     parser.add_argument('--input_dir',  required=True)
     parser.add_argument('--ckpt_path',  required=True)
     parser.add_argument('--out_dir',    default='../predictions')
-    parser.add_argument('--model_type',     default='vesselnet',
-                        choices=['vesselnet', 'attention_unet'],
-                        help='Architecture: vesselnet (SAM2 encoder + CNN decoder) or attention_unet (ResNet34 + UNet with attention gates)')
     parser.add_argument('--sharp_gate',      action='store_true')
     parser.add_argument('--use_focus_gate', action='store_true')
     parser.add_argument('--mask_dir',     default=None,
                         help='Optional ground-truth mask folder. If given, log a per-image '
                              'TP/FP/FN error map (green/red/yellow) alongside the prediction.')
-    parser.add_argument('--sam2_local_dir', default=None,
-                        help='Path to pre-downloaded SAM2 weights directory. '
-                             'Skips HF Hub download when the directory exists.')
     args = parser.parse_args()
     main(args)

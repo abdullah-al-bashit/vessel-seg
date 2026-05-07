@@ -1,12 +1,10 @@
 import os
-import sys
 import json
 import time
 import gc
 import argparse
 import random  # used in set_seed
 import shutil
-import subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,10 +16,11 @@ from tqdm import tqdm
 
 from tifffile import imread as tif_imread
 
-from dataset import load_pairs, VesselDataset, collate_fn_with_filenames
-from model   import VesselSegNet, AttentionUNet, visualize_attention_maps
-from loss    import VesselLoss
-from predict import predict_image  # full-image stitched inference for test Dice
+from dataset      import load_pairs, VesselDataset, collate_fn_with_filenames
+from model        import AttentionUNet, visualize_attention_maps
+from loss         import VesselLoss
+from predict      import predict_image  # full-image stitched inference for test Dice
+from summarize_cv import print_cv_summary
 import wandb
 
 # All training hyperparameters are loaded from the YAML config file (--config).
@@ -132,13 +131,9 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
 
 # ── Model factory ──────────────────────────────────────────────────────────────
 
-def create_model(model_type, device, sam2_model=None, sam2_local_dir=None):
-    """Create model based on architecture choice."""
-    if model_type == 'attention_unet':
-        model = AttentionUNet().to(device)
-        print(f'AttentionUNet created: trainable ResNet34 encoder + UNet decoder with attention gates')
-    else:  # vesselnet
-        model = VesselSegNet(sam2_model=sam2_model, sam2_local_dir=sam2_local_dir).to(device)
+def create_model(device):
+    model = AttentionUNet().to(device)
+    print(f'AttentionUNet created: trainable ResNet34 encoder + UNet decoder with attention gates')
     return model
 
 
@@ -234,7 +229,7 @@ def main(args):
                                   persistent_workers=True,
                                   collate_fn=collate_fn_with_filenames)
 
-        model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
+        model = create_model(device)
 
         # Clear memory after model creation and before fold begins
         if device.type == 'cuda':
@@ -384,7 +379,7 @@ def main(args):
                              persistent_workers=True,
                              collate_fn=collate_fn_with_filenames)
 
-    model = create_model(args.model_type, device, sam2_model=args.sam2_model, sam2_local_dir=args.sam2_local_dir)
+    model = create_model(device)
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, 'best_model.pth'),
                                      map_location=device))
     criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
@@ -427,14 +422,16 @@ def main(args):
     })
     wandb.finish()   # marks the run complete and uploads any remaining data
 
-    # Generate publication-ready summary
-    summary_script = os.path.join(os.path.dirname(__file__), '..', 'scripts', 'summarize_cv.py')
-    log_file = os.path.join(os.path.dirname(args.ckpt_dir), f'train_{os.environ.get("SLURM_JOB_ID", "local")}.out')
-    if os.path.exists(summary_script) and os.path.exists(log_file):
-        try:
-            subprocess.run([sys.executable, summary_script, log_file], check=False, capture_output=False)
-        except Exception as e:
-            print(f'Warning: Could not generate summary: {e}')
+    print_cv_summary(
+        folds            = args.folds,
+        best_fold        = best_fold,
+        best_loss_folds  = best_loss_folds,
+        best_epoch_folds = best_epoch_folds,
+        n_folds          = args.n_folds,
+        te_loss          = te_loss,
+        dice_per_image   = dice_per_image,
+        ckpt_dir         = args.ckpt_dir,
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -481,14 +478,6 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_contrast', type=float, default=0.1)
     parser.add_argument('--lambda_coarse',   type=float, default=0.4)
     parser.add_argument('--hard_neg_factor', type=float, default=2.0)
-    # ── Model ─────────────────────────────────────────────────────────────────
-    parser.add_argument('--model_type',     default='vesselnet',
-                        choices=['vesselnet', 'attention_unet'],
-                        help='Architecture: vesselnet (SAM2 encoder + CNN decoder) or attention_unet (ResNet34 + UNet with attention gates)')
-    parser.add_argument('--sam2_model',     default='facebook/sam2.1-hiera-tiny')
-    parser.add_argument('--sam2_local_dir', default=None,
-                        help='Path to pre-downloaded SAM2 weights. If the directory exists, '
-                             'skips HF Hub download. Run scripts/download_sam2.sh once to populate it.')
     # ── Dataset / augmentation ────────────────────────────────────────────────
     parser.add_argument('--plain_hann',     action='store_true')
     parser.add_argument('--sharp_gate',      action='store_true',
