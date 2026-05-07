@@ -48,14 +48,15 @@ mkdir -p $CKPT_DIR
 # All hyperparameters (epochs, lr, loss weights, blur aug, sam2_model, …) live
 # in the YAML file — this script only handles cluster-specific paths.
 #
-# Current default: exp_A with base-plus model
-#   sbatch scripts/submit.sh                  # runs exp_A (base-plus SAM2 encoder)
+# Current default: exp_E (AttentionUNet)
+#   sbatch scripts/submit.sh                  # runs exp_E (AttentionUNet)
 #
-# Other experiments (commented out, previously tested blur/gate configurations):
+# Other experiments (commented out):
+#   # sbatch --export=ALL,CONFIG=configs/exp_A.yaml scripts/submit.sh  # A: base-plus SAM2 encoder
 #   # sbatch --export=ALL,CONFIG=configs/exp_B.yaml scripts/submit.sh  # B: plain hann + learnable sharp gate
 #   # sbatch --export=ALL,CONFIG=configs/exp_C.yaml scripts/submit.sh  # C: aggressive blur + focus head
 #   # sbatch --export=ALL,CONFIG=configs/exp_D.yaml scripts/submit.sh  # D: plain hann + aggressive blur
-CONFIG="${CONFIG:-configs/exp_A.yaml}"
+CONFIG="${CONFIG:-configs/exp_E.yaml}"
 
 # Copy config into checkpoint dir so the run is self-documenting — inspecting
 # checkpoints/<job_id>/config.yaml tells you exactly what was run.
@@ -74,6 +75,7 @@ python src/train.py \
     --output_dir $OUTPUT_DIR \
     --ckpt_dir   $CKPT_DIR  \
     ${EPOCHS:+--epochs $EPOCHS} \
+    ${FOLDS:+--folds $FOLDS} \
     ${BATCH_SIZE:+--batch_size $BATCH_SIZE} \
     ${NUM_WORKERS:+--num_workers $NUM_WORKERS}
 

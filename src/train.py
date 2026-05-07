@@ -199,16 +199,16 @@ def main(args):
         json.dump(splits_info, f, indent=2)
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(pair_indices)):
-        # --folds lets you stop after the first N folds (still uses 5-way split → 80/20 ratio).
+        # --folds lets you stop after the first N folds (still uses n_folds-way split → 80/20 ratio).
         # e.g. --folds 1 trains exactly one fold on 80% of trainval, validated on the remaining 20%.
         if fold >= args.folds:
             break
-        # kf.split yields 5 rounds; each round rotates which 1/5 of pair_indices is val_idx,
-        # the other 4/5 become train_idx — e.g. fold 0: val_idx=[0..4], train_idx=[5..23]
+        # kf.split yields n_folds rounds; each round rotates which 1/n_folds of pairs is val_idx,
+        # the other (n_folds-1)/n_folds become train_idx
 
         # reset RNG so every fold's model starts from the same weight initialisation
         set_seed(args.seed + fold)
-        print(f'\n═══ Fold {fold+1}/{args.n_folds} ═══')
+        print(f'\n═══ Fold {fold+1}/{args.folds} ═══')
 
         # map integer indices back to actual (img_path, msk_path) tuples
         train_pairs = [trainval_pairs[i] for i in train_idx]  # e.g. 19 pairs
@@ -297,7 +297,7 @@ def main(args):
                   f'(soft_dice={va_parts["dice"]:.3f} bce={va_parts["bce"]:.3f} cldice={va_parts["cldice"]:.3f}) | '
                   f'time {t_epoch:.1f}s (train {t_train:.1f}s, val {t_val:.1f}s)')
 
-            # fold-prefixed metrics so all 5 folds are visible as separate curves in W&B
+            # fold-prefixed metrics so all folds are visible as separate curves in W&B
             wandb.log({
                 "epoch":                         epoch,
                 f"fold{fold+1}/train_loss":      tr_loss,
