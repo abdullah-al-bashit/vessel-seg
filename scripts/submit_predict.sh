@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vessel_pred
-#SBATCH --output=/home/a.bashit/vessel_seg/logs/predict_%j.out
-#SBATCH --error=/home/a.bashit/vessel_seg/logs/predict_%j.err
+#SBATCH --output=logs/predict_%j.out
+#SBATCH --error=logs/predict_%j.err
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --time=02:00:00
@@ -18,19 +18,24 @@ module load anaconda3/2024.06
 #  Loading the system module puts an older cuDNN in LD_LIBRARY_PATH and
 #  causes `CUDNN_STATUS_NOT_INITIALIZED` on the first forward pass.)
 
-source activate pytorch_env
+# Use absolute path to conda env so the correct Python is always used,
+# regardless of which node SLURM lands on. 'source activate' silently
+# falls back to the system Python on some nodes (different CUDA stacks).
+PYTHON=/home/$USER/.conda/envs/pytorch_env/bin/python
+PIP=/home/$USER/.conda/envs/pytorch_env/bin/pip
 
 # ── Guard against numpy/scikit-image binary incompatibility ───────────────────
 # Different nodes on Explorer can load different CUDA stacks, producing a numpy
 # mismatch. Reinstall scikit-image against the active numpy if the import fails.
-python -c "from skimage.transform import resize" 2>/dev/null || {
+$PYTHON -c "from skimage.transform import resize" 2>/dev/null || {
     echo "scikit-image binary incompatible with current numpy — reinstalling..."
-    pip install --force-reinstall scikit-image -q
+    $PIP install --force-reinstall scikit-image -q
 }
 
-# ── HuggingFace cache → scratch (more space than home) ────────────────────────
-export HF_HOME=/scratch/$USER/.cache/huggingface
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Forces Python to write each line to the log immediately.
+# Without it, SLURM holds output back and the log stays empty until the job finishes.
+export PYTHONUNBUFFERED=1
 
 cd /home/$USER/vessel_seg
 
@@ -38,8 +43,8 @@ cd /home/$USER/vessel_seg
 echo "Job ID:    $SLURM_JOB_ID"
 echo "Node:      $SLURMD_NODENAME"
 echo "GPU:       $(nvidia-smi --query-gpu=name --format=csv,noheader)"
-echo "CUDA:      $(python -c 'import torch; print(torch.version.cuda)')"
-python -c "import torch; print(f'PyTorch {torch.__version__}  CUDA: {torch.cuda.is_available()}  {torch.cuda.get_device_name(0)}')"
+echo "CUDA:      $($PYTHON -c 'import torch; print(torch.version.cuda)')"
+$PYTHON -c "import torch; print(f'PyTorch {torch.__version__}  CUDA: {torch.cuda.is_available()}  {torch.cuda.get_device_name(0)}')"
 echo "Start:     $(date)"
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -53,7 +58,7 @@ CKPT_PATH="${CKPT_PATH:-checkpoints/fold1_best.pth}"
 OUT_DIR="predictions"
 
 # ── Predict ────────────────────────────────────────────────────────────────────
-python src/predict.py \
+$PYTHON src/predict.py \
     --input_dir  $INPUT_DIR  \
     --mask_dir   $MASK_DIR   \
     --ckpt_path  $CKPT_PATH  \

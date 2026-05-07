@@ -21,7 +21,7 @@ Each run copies its YAML into `checkpoints/<job_id>/config.yaml` for self-docume
 - **Project path**: `/home/a.bashit/vessel_seg/`
 - **Sync command**:
   ```bash
-  rsync -avz --exclude='data/' --exclude='checkpoints/' --exclude='predictions/' --exclude='__pycache__/' --delete \
+  rsync -avz --exclude='data/' --exclude='checkpoints/' --exclude='predictions/' --exclude='weights/*.pth' --exclude='logs/' --exclude='wandb/' --exclude='__pycache__/' --delete \
       /Users/bashit.a/Downloads/vessel_seg_github/ a.bashit@login.explorer.northeastern.edu:/home/a.bashit/vessel_seg/
   ```
 - **Submit training job**:
@@ -48,7 +48,6 @@ Each run copies its YAML into `checkpoints/<job_id>/config.yaml` for self-docume
 | `src/dataset.py` | `VesselDataset` — tiling, sharpness, gradient magnitude, augmentation |
 | `src/loss.py` | `VesselLoss` — Dice + BCE hard-neg + clDice + sharpness boundary + contrastive |
 | `src/predict.py` | Full-image inference: tile → forward → stitch → W&B media log |
-| `src/postprocess.py` | Rule-based mask cleanup (blob removal, hole fill, gap close) |
 | `src/summarize_cv.py` | `print_cv_summary()` — publication-ready CV table, called directly from train.py |
 | `configs/config.yaml` | Single experiment config (AttentionUNet, 2-fold CV, 200 epochs) |
 | `scripts/submit_train.sh` | SLURM train job — override with `EPOCHS=`, `FOLDS=`, `BATCH_SIZE=` |

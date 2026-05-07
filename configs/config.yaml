@@ -13,11 +13,11 @@ seed: 42
 # ── Cross-validation (train.py → KFold, train_test_split) ────────────────────
 n_folds:    5
 test_split: 0.2
-folds:      2
+folds:      5
 patience:   30
 
 # ── Training loop (train.py → DataLoader, AdamW, scheduler) ──────────────────
-epochs:      200
+epochs:      150
 batch_size:  12          # 1.5× original 8, safe margin for cldice_loss soft_skeletonize
 lr:          0.0001
 num_workers: 8

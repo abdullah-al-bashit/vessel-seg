@@ -1,7 +1,35 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+# Local weights file — download once with scripts/download_weights.sh so every
+# job loads from disk instead of re-downloading from HuggingFace per node.
+_RESNET34_WEIGHTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'weights', 'resnet34_pretrained.pth'
+)
+
+
+def _load_resnet34_encoder(in_chans=3, out_indices=(0, 1, 2, 3, 4)):
+    """Load ResNet34 encoder, preferring a local weights file over HF download."""
+    import timm
+    if os.path.exists(_RESNET34_WEIGHTS):
+        print(f'Loading ResNet34 weights from {_RESNET34_WEIGHTS}')
+        encoder = timm.create_model('resnet34', pretrained=False,
+                                    features_only=True, in_chans=in_chans,
+                                    out_indices=out_indices)
+        encoder.load_state_dict(torch.load(_RESNET34_WEIGHTS, map_location='cpu', weights_only=True))
+    else:
+        print('weights/resnet34_pretrained.pth not found — downloading from HuggingFace and saving locally...')
+        encoder = timm.create_model('resnet34', pretrained=True,
+                                    features_only=True, in_chans=in_chans,
+                                    out_indices=out_indices)
+        os.makedirs(os.path.dirname(_RESNET34_WEIGHTS), exist_ok=True)
+        torch.save(encoder.state_dict(), _RESNET34_WEIGHTS)
+        print(f'Saved → {_RESNET34_WEIGHTS}')
+    return encoder
 
 
 class AttentionGate(nn.Module):
@@ -33,14 +61,7 @@ class AttentionUNet(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        try:
-            import timm
-        except ImportError:
-            raise ImportError("timm is required for AttentionUNet. Install: pip install timm")
-
-        self.encoder = timm.create_model('resnet34', pretrained=True,
-                                         features_only=True, in_chans=3,
-                                         out_indices=(0, 1, 2, 3, 4))
+        self.encoder = _load_resnet34_encoder()
         # ResNet34 output channels: [64, 64, 128, 256, 512]
         # Spatial: [H/4, H/8, H/16, H/32, H/32] (note: layer4 also at 1/32)
 

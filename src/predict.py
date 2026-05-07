@@ -11,7 +11,6 @@ from tqdm import tqdm
 
 from dataset     import normalize, tile_image, stitch_tiles, load_pairs, compute_sharpness, compute_gradient_magnitude
 from model       import AttentionUNet, visualize_attention_maps
-from postprocess import postprocess           # rule-based mask cleanup
 import wandb
 
 # ── Prediction filtering parameters ────────────────────────────────────────
@@ -56,7 +55,6 @@ def predict_image(model, img_path, device, sharp_gate=False, use_focus_gate=Fals
 
     # Stitch + threshold
     mask = stitch_tiles(tile_probs, tile_xs, H, W)
-    # mask = postprocess(mask)
     return mask
 
 
@@ -84,7 +82,7 @@ def main(args):
                 seed = cfg['seed']
 
     model = create_model(device)
-    model.load_state_dict(torch.load(args.ckpt_path, map_location=device))
+    model.load_state_dict(torch.load(args.ckpt_path, map_location=device, weights_only=True))
     model.eval()
 
     # ** with recursive=True descends into subdirectories (D7/, D14/, D21/),
@@ -137,9 +135,7 @@ def main(args):
         out_path = os.path.join(args.out_dir, fname)
 
         mask    = predict_image(model, img_path, device, sharp_gate=args.sharp_gate, use_focus_gate=args.use_focus_gate)
-        # mask_pp = postprocess(mask)                              # cleaned: small blobs removed, holes filled, gaps closed
-
-        # Save raw mask (no postprocessing) to evaluate network output quality
+        # Save raw mask to evaluate network output quality
         imwrite(out_path, (mask.astype(np.uint8) * 255))
         print(f'  saved → {out_path}')
 
