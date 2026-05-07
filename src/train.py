@@ -8,7 +8,7 @@ import shutil
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from sklearn.model_selection import KFold, train_test_split
@@ -41,20 +41,10 @@ def set_seed(seed=42):
 # ── One epoch ─────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
-              feat_capture=None, use_graph=None, lambda_coarse=0.4,
-              sharp_gate=False, use_focus_gate=False, lambda_focus=0.5,
               epoch=None, fold=None):
-    """
-    feat_capture: optional dict populated by a forward hook (see main()) that
-                  holds the decoder features under key 'feats'. Passed to
-                  criterion only during training so the contrastive loss can
-                  use them. Val/test pass None to skip that compute.
-    """
-    if use_graph is None:
-        use_graph = train  # default: graph during training, disabled during val
     model.train(train)
     total_loss  = 0.0
-    total_parts = {'dice': 0.0, 'bce': 0.0, 'cldice': 0.0, 'boundary': 0.0, 'contrast': 0.0, 'coarse': 0.0, 'focus': 0.0}
+    total_parts = {'tversky': 0.0, 'cldice': 0.0}
 
     use_amp = device.type == 'cuda'
     # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
@@ -69,24 +59,8 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
             fnames = batch_data[5]  # List of filenames (not a tensor)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                logits, coarse_logits, focus_logits = model(img, use_graph=use_graph, sharpness=sharp, grad_mag=grad, sharp_gate=sharp_gate, use_focus_gate=use_focus_gate)
-                feats  = feat_capture.get('feats') if (train and feat_capture is not None) else None
-                loss, loss_dict = criterion(logits, msk, hann, sharpness=sharp, feats=feats)
-                if train and coarse_logits is not None:
-                    loss_coarse, _ = criterion(coarse_logits, msk, hann, sharpness=sharp)
-                    loss = loss + lambda_coarse * loss_coarse
-                    loss_dict['coarse'] = loss_coarse.item()
-                else:
-                    loss_dict['coarse'] = 0.0
-                # Focus head loss: teach it to predict in-focus vs blurry regions.
-                # Supervised by the VoL sharpness map resized to feature resolution.
-                if focus_logits is not None and sharp is not None:
-                    s = F.interpolate(sharp, size=focus_logits.shape[2:], mode='bilinear', align_corners=False)
-                    focus_loss = F.binary_cross_entropy_with_logits(focus_logits, s)
-                    loss = loss + lambda_focus * focus_loss
-                    loss_dict['focus'] = focus_loss.item()
-                else:
-                    loss_dict['focus'] = 0.0
+                logits = model(img, sharpness=sharp, grad_mag=grad)  # (B, 1, H, W)
+                loss, loss_dict = criterion(logits, msk, hann)
 
             if train:
                 optimizer.zero_grad()
@@ -236,16 +210,8 @@ def main(args):
             torch.cuda.empty_cache()
         gc.collect()
 
-        # Forward hook registered before compile so it fires on the underlying module.
-        captured = {}
-        def _capture_features(_module, inputs, _output):
-            captured['feats'] = inputs[0]
-        feat_hook = model.head.register_forward_hook(_capture_features)  # removed at end of fold
-
         criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
-                               lambda_boundary=args.lambda_boundary,
-                               lambda_contrast=args.lambda_contrast,
-                               hard_neg_factor=args.hard_neg_factor)
+                               tversky_beta=args.tversky_beta)
         scaler    = GradScaler() if device.type == 'cuda' else None
 
         # Only train decoder + graph net — encoder is frozen inside model
@@ -261,19 +227,10 @@ def main(args):
         for epoch in range(1, args.epochs + 1):
             train_ds.seed = args.seed + epoch  # vary augmentations each epoch
 
-            # CNN-only: graph path is slower and does not improve val Dice over pure CNN.
-            use_graph = False
-
             # Wall-clock per-phase timing — used for accurate runtime estimation
             t_train_start = time.perf_counter()
             tr_loss, tr_parts = run_epoch(model, train_loader, criterion,
-                                          optimizer, scaler, device, train=True,
-                                          use_graph=use_graph,
-                                          feat_capture=captured,
-                                          lambda_coarse=args.lambda_coarse,
-                                          sharp_gate=args.sharp_gate,
-                                          use_focus_gate=args.use_focus_gate,
-                                          lambda_focus=args.lambda_focus)
+                                          optimizer, scaler, device, train=True)
             t_train = time.perf_counter() - t_train_start
 
             t_val_start = time.perf_counter()
@@ -287,29 +244,20 @@ def main(args):
 
             print(f'Epoch {epoch:3d} | '
                   f'train loss {tr_loss:.4f} '
-                  f'(soft_dice={tr_parts["dice"]:.3f} bce={tr_parts["bce"]:.3f} cldice={tr_parts["cldice"]:.3f}) | '
+                  f'(tversky={tr_parts["tversky"]:.3f} cldice={tr_parts["cldice"]:.3f}) | '
                   f'val   loss {va_loss:.4f} '
-                  f'(soft_dice={va_parts["dice"]:.3f} bce={va_parts["bce"]:.3f} cldice={va_parts["cldice"]:.3f}) | '
+                  f'(tversky={va_parts["tversky"]:.3f} cldice={va_parts["cldice"]:.3f}) | '
                   f'time {t_epoch:.1f}s (train {t_train:.1f}s, val {t_val:.1f}s)')
 
             # fold-prefixed metrics so all folds are visible as separate curves in W&B
             wandb.log({
-                "epoch":                         epoch,
-                f"fold{fold+1}/train_loss":      tr_loss,
-                f"fold{fold+1}/train_dice":      tr_parts["dice"],
-                f"fold{fold+1}/train_bce":       tr_parts["bce"],
-                f"fold{fold+1}/train_cldice":    tr_parts["cldice"],
-                f"fold{fold+1}/train_boundary":  tr_parts["boundary"],
-                f"fold{fold+1}/train_contrast":  tr_parts["contrast"],
-                f"fold{fold+1}/train_coarse":    tr_parts["coarse"],
-                f"fold{fold+1}/train_focus":     tr_parts["focus"],
-                f"fold{fold+1}/val_loss":        va_loss,
-                f"fold{fold+1}/val_dice":        va_parts["dice"],
-                f"fold{fold+1}/val_bce":         va_parts["bce"],
-                f"fold{fold+1}/val_cldice":      va_parts["cldice"],
-                f"fold{fold+1}/epoch_time_s":    t_epoch,
-                f"fold{fold+1}/train_time_s":    t_train,
-                f"fold{fold+1}/val_time_s":      t_val,
+                "epoch":                           epoch,
+                f"fold{fold+1}/train_loss":        tr_loss,
+                f"fold{fold+1}/train_tversky":     tr_parts["tversky"],
+                f"fold{fold+1}/train_cldice":      tr_parts["cldice"],
+                f"fold{fold+1}/val_loss":          va_loss,
+                f"fold{fold+1}/val_tversky":       va_parts["tversky"],
+                f"fold{fold+1}/val_cldice":        va_parts["cldice"],
             })
 
             # model selection and early stopping based on full val loss (VesselLoss)
@@ -341,7 +289,6 @@ def main(args):
         best_epoch_folds.append(best_epoch)
         print(f'Fold {fold+1} best val loss: {best_loss:.4f} (epoch {best_epoch})')
         wandb.log({f"fold{fold+1}/best_val_loss": best_loss, f"fold{fold+1}/best_epoch": best_epoch})
-        feat_hook.remove()  # detach the forward hook before next fold rebuilds the model
 
         # Explicit memory cleanup between folds to prevent accumulation across folds
         if device.type == 'cuda':
@@ -383,14 +330,12 @@ def main(args):
     model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, 'best_model.pth'),
                                      map_location=device))
     criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
-                           lambda_boundary=args.lambda_boundary,
-                           lambda_contrast=args.lambda_contrast,
-                           hard_neg_factor=args.hard_neg_factor)
+                           tversky_beta=args.tversky_beta)
 
     te_loss, te_parts = run_epoch(model, test_loader, criterion,
                                    None, None, device, train=False)
     print(f'Test loss {te_loss:.4f} '
-          f'(soft_dice={te_parts["dice"]:.3f} bce={te_parts["bce"]:.3f} cldice={te_parts["cldice"]:.3f})')
+          f'(tversky={te_parts["tversky"]:.3f} cldice={te_parts["cldice"]:.3f})')
 
     # ── Stitched-image Dice on test set (interpretable 0-1 metric) ────────────
     # te_loss above is computed on tile-level patches with Hanning weighting,
@@ -400,7 +345,7 @@ def main(args):
     print('\nStitched-image Dice on test set:')
     dice_per_image = []
     for img_path, msk_path in test_pairs:
-        pred_mask = predict_image(model, img_path, device, sharp_gate=args.sharp_gate, use_focus_gate=args.use_focus_gate)
+        pred_mask = predict_image(model, img_path, device)
         gt_mask   = tif_imread(msk_path) > 0                       # (H, W) bool
         inter     = float(np.logical_and(pred_mask, gt_mask).sum())
         denom     = float(pred_mask.sum() + gt_mask.sum())
@@ -412,8 +357,7 @@ def main(args):
 
     wandb.log({
         "test/loss":             te_loss,
-        "test/dice":             te_parts["dice"],
-        "test/bce":              te_parts["bce"],
+        "test/tversky":          te_parts["tversky"],
         "test/cldice":           te_parts["cldice"],
         "test/dice_stitched":    mean_test_dice,        # standard Dice ∈ [0, 1] — clinically interpretable
         "best_fold":             best_fold,
@@ -473,19 +417,15 @@ if __name__ == '__main__':
     parser.add_argument('--lr',           type=float, default=1e-4)
     parser.add_argument('--num_workers',  type=int,   default=8)
     # ── Loss weights ──────────────────────────────────────────────────────────
-    parser.add_argument('--lambda_cldice',   type=float, default=1.0)
-    parser.add_argument('--lambda_boundary', type=float, default=0.5)
-    parser.add_argument('--lambda_contrast', type=float, default=0.1)
-    parser.add_argument('--lambda_coarse',   type=float, default=0.4)
-    parser.add_argument('--hard_neg_factor', type=float, default=2.0)
+    parser.add_argument('--lambda_cldice',   type=float, default=1.0,
+                        help='Weight on clDice topology loss.')
+    # Tversky beta: FN weight. alpha is derived as (1 - beta) so alpha + beta = 1 always.
+    # beta=0.5 → standard Dice. beta=0.7 → penalises missed vessels 2.3× more than FP.
+    # Increase beta (e.g. 0.8) to recover more thin vessels at the cost of more FP.
+    parser.add_argument('--tversky_beta',    type=float, default=0.7,
+                        help='Tversky FN weight; alpha = 1 - beta is derived automatically.')
     # ── Dataset / augmentation ────────────────────────────────────────────────
     parser.add_argument('--plain_hann',     action='store_true')
-    parser.add_argument('--sharp_gate',      action='store_true',
-                        help='Multiply decoder features by sharpness map before head — suppresses blurry predictions.')
-    parser.add_argument('--use_focus_gate', action='store_true',
-                        help='Learn an in-focus prediction head; gate decoder features by predicted focus map.')
-    parser.add_argument('--lambda_focus',   type=float, default=0.5,
-                        help='Weight on the focus head BCE loss.')
     parser.add_argument('--blur_prob',      type=float, default=0.3)
     parser.add_argument('--blur_sigma_max', type=float, default=4.0)
     # YAML config values become defaults; explicit CLI flags still override.

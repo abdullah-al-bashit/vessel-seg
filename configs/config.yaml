@@ -24,10 +24,9 @@ num_workers: 8
 
 # ── Loss weights (train.py → loss.py VesselLoss) ─────────────────────────────
 lambda_cldice:   1.0
-lambda_boundary: 0.5
-lambda_contrast: 0.1
-lambda_coarse:   0.4         # inactive for AttentionUNet (no graph path)
-hard_neg_factor: 2.0
+# Tversky beta: FN weight. alpha = 1 - beta is derived automatically (alpha + beta = 1).
+# beta=0.5 → Dice. beta=0.7 → penalises missed vessels 2.3× more than FP.
+tversky_beta:    0.7
 
 # ── Model architecture (train.py → model_type) ───────────────────────────────
 model_type: attention_unet   # ResNet34 encoder + UNet decoder + attention gates
@@ -35,11 +34,8 @@ model_type: attention_unet   # ResNet34 encoder + UNet decoder + attention gates
                              # Attention gates suppress low-activation (blurry) regions
                              # 3-channel input: [gray, grad_mag, sharpness] natively supported
 
-# ── Loss weighting gate (train.py → VesselDataset(sharp_hann = not plain_hann)) ─
+# ── Hanning gate (train.py → VesselDataset) ──────────────────────────────────
 plain_hann: false
-sharp_gate: false            # Attention UNet uses attention gates instead
-use_focus_gate: false
-lambda_focus: 0.5
 
 # ── Blur augmentation (train.py → VesselDataset → dataset.py _augment()) ──────
 blur_prob:      0.3          # same as exp_A — isolates architecture effect
