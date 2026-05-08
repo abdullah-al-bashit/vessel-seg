@@ -15,7 +15,7 @@ patience:   30
 
 # ── Training ──────────────────────────────────────────────────────────────────
 epochs:      150
-batch_size:  10
+batch_size:  12
 lr:          0.0001
 num_workers: 8
 
