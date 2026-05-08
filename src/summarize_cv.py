@@ -10,14 +10,14 @@ def print_cv_summary(folds, best_fold, best_loss_folds, best_epoch_folds,
     Print publication-ready CV summary directly from in-memory training results.
 
     Args:
-        folds:            number of folds actually trained
-        best_fold:        1-based index of selected fold
-        best_loss_folds:  list of best val loss per fold
+        folds:           number of folds actually trained
+        best_fold:       1-based index of selected fold
+        best_loss_folds: list of best val loss per fold
         best_epoch_folds: list of best epoch per fold
-        n_folds:          total folds in the CV split (from config)
-        te_loss:          scalar test loss
-        dice_per_image:   list of per-image Dice scores on test set
-        ckpt_dir:         checkpoint directory (for display)
+        n_folds:         total folds in the CV split (from config)
+        te_loss:         scalar test loss
+        dice_per_image:  list of per-image Dice scores on test set
+        ckpt_dir:        checkpoint directory (for display)
     """
     lines = []
     sep = "=" * 70
@@ -46,7 +46,7 @@ def print_cv_summary(folds, best_fold, best_loss_folds, best_epoch_folds,
     if dice_per_image:
         arr = np.array(dice_per_image)
         lines += [
-            f"\nPer-image Dice Coefficient:",
+            f"\nPer-image Dice:",
             f"  Mean:     {arr.mean():.4f}",
             f"  Std:      {arr.std():.4f}",
             f"  Min:      {arr.min():.4f}",
@@ -58,7 +58,6 @@ def print_cv_summary(folds, best_fold, best_loss_folds, best_epoch_folds,
         for thr in [0.80, 0.85, 0.90, 0.95]:
             n = (arr >= thr).sum()
             lines.append(f"  Dice ≥ {thr}: {n}/{len(arr)} ({100*n/len(arr):.1f}%)")
-
         ci = stats.t.interval(0.95, len(arr) - 1, loc=arr.mean(), scale=stats.sem(arr))
         lines += [
             f"\nStatistical Summary:",

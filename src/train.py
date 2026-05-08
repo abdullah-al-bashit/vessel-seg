@@ -3,9 +3,10 @@ import json
 import time
 import gc
 import argparse
-import random  # used in set_seed
+import random
 import shutil
 import numpy as np
+import timm
 import torch
 import torch.nn as nn
 
@@ -19,12 +20,9 @@ from tifffile import imread as tif_imread
 from dataset      import load_pairs, VesselDataset, collate_fn_with_filenames
 from model        import AttentionUNet, visualize_attention_maps
 from loss         import VesselLoss
-from predict      import predict_image  # full-image stitched inference for test Dice
+from predict      import predict_image
 from summarize_cv import print_cv_summary
 import wandb
-
-# All training hyperparameters are loaded from the YAML config file (--config).
-# See configs/exp_*.yaml for the full parameter set and documentation.
 
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
@@ -38,84 +36,140 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark     = False # disable auto-tuner (picks different algos each run)
 
 
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+
+_RESNET34_WEIGHTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'weights', 'resnet34_pretrained.pth'
+)
+
+
+def create_model(device, ckpt_path=None):
+    model = AttentionUNet()
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'] if isinstance(ckpt, dict) else ckpt)
+        print(f'AttentionUNet loaded from checkpoint: {ckpt_path}')
+    else:
+        if os.path.exists(_RESNET34_WEIGHTS):
+            print(f'Loading ResNet34 weights from {_RESNET34_WEIGHTS}')
+            model.encoder.load_state_dict(torch.load(_RESNET34_WEIGHTS, map_location='cpu', weights_only=True))
+        else:
+            print('weights/resnet34_pretrained.pth not found — downloading from HuggingFace and saving locally...')
+            enc = timm.create_model('resnet34', pretrained=True, features_only=True, in_chans=3, out_indices=(0,1,2,3,4))
+            os.makedirs(os.path.dirname(_RESNET34_WEIGHTS), exist_ok=True)
+            torch.save(enc.state_dict(), _RESNET34_WEIGHTS)
+            model.encoder.load_state_dict(enc.state_dict())
+            print(f'Saved → {_RESNET34_WEIGHTS}')
+        print('AttentionUNet created: trainable ResNet34 encoder + UNet decoder with attention gates')
+    return model.to(device)
+
+
+def _cache_clear(device):
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
+def _save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, val_loss,
+                     artifact_name, description, args=None):
+    torch.save({
+        'epoch':                epoch,
+        'model_state_dict':     model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'scaler_state_dict':    scaler.state_dict() if scaler else None,
+        'val_loss':             val_loss,
+        'config':               vars(args) if args is not None else {},
+    }, path)
+    artifact = wandb.Artifact(artifact_name, type="model", description=description)
+    artifact.add_file(os.path.abspath(path))
+    wandb.log_artifact(artifact)
+
+
 # ── One epoch ─────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
               epoch=None, fold=None):
     model.train(train)
     total_loss  = 0.0
-    total_parts = {'tversky': 0.0, 'cldice': 0.0}
+    total_parts = {'tversky': 0.0, 'cldice': 0.0, 'skel_density': 0.0}
+    dice_num    = 0.0
+    dice_den    = 0.0
 
     use_amp = device.type == 'cuda'
-    # Select gradient context: enable for training (backprop), disable for val/test (saves memory).
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
         for batch_idx, batch_data in enumerate(tqdm(loader)):
-            img   = batch_data[0].to(device)
-            msk   = batch_data[1].to(device)
-            hann  = batch_data[2].to(device)
-            sharp = batch_data[3].to(device)
-            grad  = batch_data[4].to(device)
-            fnames = batch_data[5]  # List of filenames (not a tensor)
+            img    = batch_data[0].to(device)
+            msk    = batch_data[1].to(device)
+            hann   = batch_data[2].to(device)
+            sharp  = batch_data[3].to(device)
+            grad   = batch_data[4].to(device)
+            fnames = batch_data[5]
 
             with autocast(device_type=device.type, enabled=use_amp):
-                logits = model(img, sharpness=sharp, grad_mag=grad)  # (B, 1, H, W)
-                loss, loss_dict = criterion(logits, msk, hann)
+                logits = model(img, sharpness=sharp, grad_mag=grad)
+                loss, loss_dict, pred = criterion(logits, msk, hann)
 
             if train:
                 optimizer.zero_grad()
                 if use_amp:
                     scaler.scale(loss).backward()       # multiply loss by scale factor, then backprop to keep float16 gradients from flushing to zero
                     scaler.unscale_(optimizer)          # divide gradients back by scale factor so clip operates on true magnitudes
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # cap gradient norm to avoid exploding updates
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)              # update weights; skips entire step if any gradient is inf/nan
                     scaler.update()                     # increase scale factor if step was taken, decrease if inf/nan was detected
                 else:
-                    loss.backward()                                        # compute gradients
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # prevent gradient explosion
-                    optimizer.step()                                       # update weights
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
 
-            total_loss += loss.item()                      # scalar float — .item() detaches from graph
+            total_loss += loss.item()
             for k in total_parts:
-                total_parts[k] += loss_dict[k]  # scalar float — loss_dict values are already Python floats via .item() in VesselLoss
+                total_parts[k] += loss_dict[k]
+            with torch.no_grad():
+                pred_bin  = (pred.detach() > 0.5)
+                dice_num += 2.0 * (pred_bin & msk.bool()).float().sum().item()
+                dice_den += pred_bin.float().sum().item() + msk.float().sum().item()
 
-            # Log attention maps every 10 validation epochs on first batch
-            if (not train) and (epoch is not None) and (fold is not None) and (epoch % 10 == 0) and (batch_idx == 0):
-                if hasattr(model, 'att1'):
-                    try:
-                        img_np = img[0, 0].cpu().numpy()
-                        lo, hi = np.percentile(img_np, (1, 99))
-                        img_u8 = np.clip((img_np - lo) / (hi - lo + 1e-8) * 255, 0, 255).astype(np.uint8)
-                        img_rgb = np.stack([img_u8] * 3, axis=-1)
-                        attn_panels = visualize_attention_maps(model, img_rgb)
-                        fname = fnames[0]  # fnames is a list of filenames from custom collate
-                        log_dict = {
-                            f"fold{fold+1}/input_image": wandb.Image(img_rgb, caption=f"Input tile from {fname}"),
-                        }
-                        log_dict.update({f"fold{fold+1}/{k}": v for k, v in attn_panels.items()})
-                        wandb.log(log_dict)
-                        print(f'  ✓ logged input + {len(attn_panels)} attention panels (fold {fold+1}, epoch {epoch}, file: {fname})')
-                    except Exception as e:
-                        print(f'  ⚠ attention logging failed: {e}')
+            # Log prediction + attention maps every 10 val epochs on first batch
+            if (not train) and (epoch is not None) and (fold is not None) and \
+               (epoch % 10 == 0) and (batch_idx == 0):
+                try:
+                    fname   = fnames[0]
+                    cap     = f"[val] {fname} | fold {fold+1} epoch {epoch}"
+                    img_np  = img[0, 0].cpu().numpy()
+                    lo, hi  = np.percentile(img_np, (1, 99))
+                    img_u8  = np.clip((img_np - lo) / (hi - lo + 1e-8) * 255, 0, 255).astype(np.uint8)
+                    img_rgb = np.stack([img_u8] * 3, axis=-1)
+                    prob_np  = pred[0, 0].detach().cpu().numpy()
+                    gt_u8    = (msk[0, 0].cpu().numpy()   * 255).astype(np.uint8)
+                    grad_u8  = (grad[0, 0].cpu().numpy()  * 255).astype(np.uint8)
+                    sharp_u8 = (sharp[0, 0].cpu().numpy() * 255).astype(np.uint8)
+                    log_dict = {
+                        f"fold{fold+1}/input_image": wandb.Image(img_u8,                                 caption=f"Input    | {cap}"),
+                        f"fold{fold+1}/ch_grad":     wandb.Image(grad_u8,                                caption=f"Grad mag | {cap}"),
+                        f"fold{fold+1}/ch_sharp":    wandb.Image(sharp_u8,                               caption=f"Sharpness| {cap}"),
+                        f"fold{fold+1}/gt_mask":     wandb.Image(gt_u8,                                  caption=f"GT       | {cap}"),
+                        f"fold{fold+1}/pred_prob":   wandb.Image((prob_np * 255).astype(np.uint8),       caption=f"P(vessel)| {cap}"),
+                        f"fold{fold+1}/pred_binary": wandb.Image((prob_np > 0.5).astype(np.uint8) * 255, caption=f"Pred>0.5 | {cap}"),
+                    }
+                    attn_panels = visualize_attention_maps(model, img_rgb)
+                    log_dict.update({f"fold{fold+1}/{k}": v for k, v in attn_panels.items()})
+                    wandb.log(log_dict)
+                    print(f'  ✓ logged val visualizations ({cap})')
+                except Exception as e:
+                    print(f'  ⚠ visualization logging failed: {e}')
 
-    n = len(loader)                                        # number of batches in the epoch
-    parts = {k: v / n for k, v in total_parts.items()}    # per-sub-loss epoch averages
-    return total_loss / n, parts                           # epoch-averaged total loss and sub-losses
-
-
-# ── Model factory ──────────────────────────────────────────────────────────────
-
-def create_model(device):
-    model = AttentionUNet().to(device)
-    print(f'AttentionUNet created: trainable ResNet34 encoder + UNet decoder with attention gates')
-    return model
+    n = len(loader)
+    return total_loss / n, {k: v / n for k, v in total_parts.items()}, dice_num / (dice_den + 1e-8)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(args):
     set_seed(args.seed)
-    # MPS = Apple Silicon GPU (Metal); falls back to CPU on Intel Macs.
     device = torch.device(
         'cuda' if torch.cuda.is_available()
         else 'mps' if torch.backends.mps.is_available()
@@ -123,35 +177,22 @@ def main(args):
     )
     print(f'Device: {device}')
 
-    # Load all annotated pairs
-    pairs = load_pairs(args.input_dir, args.output_dir)  # e.g. [('data/1_img.tif', 'data/1_msk.tif'), ('data/2_img.tif', 'data/2_msk.tif'), ...]
+    pairs = load_pairs(args.input_dir, args.output_dir)
     print(f'Annotated pairs found: {len(pairs)}')
 
-    # Hold out test_split fraction as final test — evaluated once, never touches training.
-    trainval_pairs, test_pairs = train_test_split(pairs, test_size=args.test_split, random_state=args.seed)
-    # e.g. pairs=30 → trainval_pairs=[('1_img.tif','1_msk.tif'), ...] (24 items), test_pairs=[('7_img.tif','7_msk.tif'), ...] (6 items)
+    trainval_pairs, test_pairs = train_test_split(
+        pairs, test_size=args.test_split, random_state=args.seed)
     print(f'Train+val pairs: {len(trainval_pairs)}  |  Test pairs: {len(test_pairs)}')
 
-    # ── W&B run — one run covers all folds + final test ───────────────────────
-    # vars(args) logs every YAML/CLI parameter so each W&B run is fully reproducible.
-    wandb.init(
-        entity  = args.wandb_entity,
-        project = args.wandb_project,
-        config  = vars(args),
-    )
+    wandb.init(entity=args.wandb_entity, project=args.wandb_project, config=vars(args))
 
-    # n_folds-way CV on image-level pairs (not tile-level) to avoid data leakage
-    kf           = KFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)  # splitter object — actual split happens at kf.split() below
-    pair_indices = list(range(len(trainval_pairs)))  # e.g. [0, 1, 2, ..., 23] for 24 trainval pairs
-    best_loss_folds = []                             # best val loss per fold — used to select fold for test evaluation
-    best_epoch_folds = []                            # best epoch per fold — for tracking which checkpoint is best
+    kf           = KFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+    pair_indices = list(range(len(trainval_pairs)))
+    fold_splits  = list(kf.split(pair_indices))
 
-    # Log every file's role (fold number + train/val/test) in one Table.
-    # wandb.Table stores string data properly — wandb.log() with strings or lists
-    # would be treated as metrics and silently dropped or misrepresented.
-    # fold=0 marks the held-out test set (never used during training).
+    # Log every file's role (fold + train/val/test) in one Table.
     split_table = wandb.Table(columns=["fold", "split", "file"])
-    for fold_i, (tr_idx, va_idx) in enumerate(kf.split(pair_indices)):
+    for fold_i, (tr_idx, va_idx) in enumerate(fold_splits):
         for i in tr_idx:
             split_table.add_data(fold_i + 1, "train", trainval_pairs[i][0])
         for i in va_idx:
@@ -160,30 +201,27 @@ def main(args):
         split_table.add_data(0, "test", p[0])
     wandb.log({"data_splits": split_table})
 
-    # Save filename → split label so predict.py can label each image in the W&B
-    # Media panel without needing to know which folder is test vs trainval.
-    splits_info = {os.path.basename(p[0]): "trainval" for p in trainval_pairs}
-    splits_info.update({os.path.basename(p[0]): "test" for p in test_pairs})
+    splits_info = {**{os.path.basename(p[0]): "trainval" for p in trainval_pairs},
+                   **{os.path.basename(p[0]): "test"     for p in test_pairs}}
     with open(os.path.join(args.ckpt_dir, "data_splits.json"), "w") as f:
         json.dump(splits_info, f, indent=2)
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(pair_indices)):
-        # --folds lets you stop after the first N folds (still uses n_folds-way split → 80/20 ratio).
-        # e.g. --folds 1 trains exactly one fold on 80% of trainval, validated on the remaining 20%.
+    best_loss_folds  = []
+    best_epoch_folds = []
+
+    for fold, (train_idx, val_idx) in enumerate(fold_splits):
         if fold >= args.folds:
             break
-        # kf.split yields n_folds rounds; each round rotates which 1/n_folds of pairs is val_idx,
-        # the other (n_folds-1)/n_folds become train_idx
 
-        # reset RNG so every fold's model starts from the same weight initialisation
+        wandb.define_metric(f"fold{fold+1}/epoch", hidden=True)
+        wandb.define_metric(f"fold{fold+1}/*",      step_metric=f"fold{fold+1}/epoch")
+
         set_seed(args.seed + fold)
         print(f'\n═══ Fold {fold+1}/{args.folds} ═══')
 
-        # map integer indices back to actual (img_path, msk_path) tuples
-        train_pairs = [trainval_pairs[i] for i in train_idx]  # e.g. 19 pairs
-        val_pairs   = [trainval_pairs[i] for i in val_idx]    # e.g. 5 pairs
+        train_pairs = [trainval_pairs[i] for i in train_idx]
+        val_pairs   = [trainval_pairs[i] for i in val_idx]
 
-        # tile each pair; train set gets augmentation, val set does not
         train_ds = VesselDataset(train_pairs, augment=True,  seed=args.seed,
                                  sharp_hann=not args.plain_hann,
                                  blur_prob=args.blur_prob,
@@ -192,179 +230,148 @@ def main(args):
                                  sharp_hann=not args.plain_hann)
         print(f'  Train tiles: {len(train_ds)}  |  Val tiles: {len(val_ds)}')
 
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                  shuffle=True,  num_workers=args.num_workers,
-                                  pin_memory=True,         # allocates batches in CPU memory that the GPU can read directly, avoiding an extra copy
-                                  persistent_workers=True, # keeps worker processes alive between epochs so they don't need to be spawned again each epoch
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers,
+                                  pin_memory=True,          # allocates batches in CPU memory that the GPU can read directly
+                                  persistent_workers=True,  # keeps workers alive between epochs
                                   collate_fn=collate_fn_with_filenames)
-        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                                  shuffle=False, num_workers=args.num_workers,
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                                  num_workers=args.num_workers,
                                   pin_memory=True,
                                   persistent_workers=True,
                                   collate_fn=collate_fn_with_filenames)
 
-        model = create_model(device)
-
-        # Clear memory after model creation and before fold begins
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-        gc.collect()
-
-        criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
+        model = create_model(device, ckpt_path=args.warmstart_ckpt or None)
+        criterion = VesselLoss(lambda_tversky=args.lambda_tversky,
+                               lambda_cldice=args.lambda_cldice,
+                               lambda_skel_density=args.lambda_skel_density,
                                tversky_beta=args.tversky_beta)
         scaler    = GradScaler() if device.type == 'cuda' else None
-
-        # Only train decoder + graph net — encoder is frozen inside model
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6)
 
-        best_loss  = float('inf')  # best val loss this fold (full VesselLoss = soft_dice + bce + cldice)
-        best_epoch = 0             # which epoch had best validation loss
-        no_improve = 0             # counter — resets to 0 whenever val loss improves, increments otherwise
+        best_loss  = float('inf')
+        best_epoch = 0
+        no_improve = 0
 
         for epoch in range(1, args.epochs + 1):
-            train_ds.seed = args.seed + epoch  # vary augmentations each epoch
+            train_ds.seed = args.seed + epoch
 
-            # Wall-clock per-phase timing — used for accurate runtime estimation
-            t_train_start = time.perf_counter()
-            tr_loss, tr_parts = run_epoch(model, train_loader, criterion,
-                                          optimizer, scaler, device, train=True)
-            t_train = time.perf_counter() - t_train_start
-
-            t_val_start = time.perf_counter()
-            va_loss, va_parts = run_epoch(model, val_loader,   criterion,
-                                          None,    None,       device, train=False,
-                                          epoch=epoch, fold=fold)
-            t_val = time.perf_counter() - t_val_start
+            t0 = time.perf_counter()
+            tr_loss, tr_parts, tr_dice = run_epoch(model, train_loader, criterion,
+                                                    optimizer, scaler, device, train=True)
+            t1 = time.perf_counter()
+            va_loss, va_parts, va_dice = run_epoch(model, val_loader, criterion,
+                                                    None, None, device, train=False,
+                                                    epoch=epoch, fold=fold)
             scheduler.step()
-
-            t_epoch = t_train + t_val
+            t_epoch = time.perf_counter() - t0
 
             print(f'Epoch {epoch:3d} | '
-                  f'train loss {tr_loss:.4f} '
-                  f'(tversky={tr_parts["tversky"]:.3f} cldice={tr_parts["cldice"]:.3f}) | '
-                  f'val   loss {va_loss:.4f} '
-                  f'(tversky={va_parts["tversky"]:.3f} cldice={va_parts["cldice"]:.3f}) | '
-                  f'time {t_epoch:.1f}s (train {t_train:.1f}s, val {t_val:.1f}s)')
+                  f'train {tr_loss:.4f} dice={tr_dice:.4f} '
+                  f'(tv={tr_parts["tversky"]:.3f} cl={tr_parts["cldice"]:.3f} sd={tr_parts["skel_density"]:.3f}) | '
+                  f'val {va_loss:.4f} dice={va_dice:.4f} '
+                  f'(tv={va_parts["tversky"]:.3f} cl={va_parts["cldice"]:.3f} sd={va_parts["skel_density"]:.3f}) | '
+                  f'{t_epoch:.1f}s (train {t1-t0:.1f}s)')
 
-            # fold-prefixed metrics so all folds are visible as separate curves in W&B
             wandb.log({
-                "epoch":                           epoch,
-                f"fold{fold+1}/train_loss":        tr_loss,
-                f"fold{fold+1}/train_tversky":     tr_parts["tversky"],
-                f"fold{fold+1}/train_cldice":      tr_parts["cldice"],
-                f"fold{fold+1}/val_loss":          va_loss,
-                f"fold{fold+1}/val_tversky":       va_parts["tversky"],
-                f"fold{fold+1}/val_cldice":        va_parts["cldice"],
+                f"fold{fold+1}/epoch":              epoch,
+                f"fold{fold+1}/train_loss":         tr_loss,
+                f"fold{fold+1}/train_dice":         tr_dice,
+                f"fold{fold+1}/train_tversky":      tr_parts["tversky"],
+                f"fold{fold+1}/train_cldice":       tr_parts["cldice"],
+                f"fold{fold+1}/train_skel_density": tr_parts["skel_density"],
+                f"fold{fold+1}/val_loss":           va_loss,
+                f"fold{fold+1}/val_dice":           va_dice,
+                f"fold{fold+1}/val_tversky":        va_parts["tversky"],
+                f"fold{fold+1}/val_cldice":         va_parts["cldice"],
+                f"fold{fold+1}/val_skel_density":   va_parts["skel_density"],
             })
 
-            # model selection and early stopping based on full val loss (VesselLoss)
             if va_loss < best_loss:
                 best_loss  = va_loss
                 best_epoch = epoch
                 no_improve = 0
                 ckpt_path  = os.path.join(args.ckpt_dir, f'fold{fold+1}_best.pth')
-                torch.save(model.state_dict(), ckpt_path)
+                _save_checkpoint(ckpt_path, epoch, model, optimizer, scheduler, scaler,
+                                 best_loss, f"fold{fold+1}_best",
+                                 f"fold{fold+1} best checkpoint, val_loss={best_loss:.4f}", args)
                 print(f'  ✓ saved {ckpt_path}  (val loss {best_loss:.4f})')
-                # Artifact: uploads the checkpoint file to W&B so it's stored with
-                # this run and downloadable by name — no need to track file paths manually
-                artifact = wandb.Artifact(f"fold{fold+1}_best", type="model",
-                                          description=f"fold{fold+1} best checkpoint, val_loss={best_loss:.4f}")
-                artifact.add_file(ckpt_path)
-                wandb.log_artifact(artifact)
             else:
                 no_improve += 1
                 if no_improve >= args.patience:
                     print(f'  Early stopping at epoch {epoch}')
                     break
 
-            # Explicit garbage collection and cache clearing after each epoch to prevent memory leaks
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-            gc.collect()
-
         best_loss_folds.append(best_loss)
         best_epoch_folds.append(best_epoch)
         print(f'Fold {fold+1} best val loss: {best_loss:.4f} (epoch {best_epoch})')
-        wandb.log({f"fold{fold+1}/best_val_loss": best_loss, f"fold{fold+1}/best_epoch": best_epoch})
+        wandb.log({f"fold{fold+1}/best_val_loss": best_loss,
+                   f"fold{fold+1}/best_epoch":    best_epoch})
 
-        # Explicit memory cleanup between folds to prevent accumulation across folds
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-        gc.collect()
+        _cache_clear(device)
 
-    print(f'\n{args.n_folds}-fold CV val loss: {np.mean(best_loss_folds):.4f} '
-          f'± {np.std(best_loss_folds):.4f}')
+    # ── Select best fold and promote checkpoint ────────────────────────────────
+    best_fold = int(np.argmin(best_loss_folds)) + 1
+    print(f'\nBest fold: {best_fold}  (val loss {best_loss_folds[best_fold-1]:.4f}, '
+          f'epoch {best_epoch_folds[best_fold-1]})')
+
+    shutil.copy(os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth'),
+                os.path.join(args.ckpt_dir, 'best_model.pth'))
+    for fold_num in range(1, args.folds + 1):
+        p = os.path.join(args.ckpt_dir, f'fold{fold_num}_best.pth')
+        if os.path.exists(p):
+            os.remove(p)
 
     # ── Final test evaluation ──────────────────────────────────────────────────
-    # Load the fold with the lowest val loss and evaluate once on the held-out test set.
-    best_fold = int(np.argmin(best_loss_folds)) + 1
-    best_fold_loss = best_loss_folds[best_fold - 1]
-    best_fold_epoch = best_epoch_folds[best_fold - 1]
-    print(f'\nEvaluating fold {best_fold} (epoch {best_fold_epoch}, val loss {best_fold_loss:.4f}) on held-out test set ...')
-
-    # Copy best fold's checkpoint to stable path for predict job
-    best_fold_ckpt = os.path.join(args.ckpt_dir, f'fold{best_fold}_best.pth')
-    best_model_ckpt = os.path.join(args.ckpt_dir, 'best_model.pth')
-    shutil.copy(best_fold_ckpt, best_model_ckpt)
-
-    # Delete all fold-specific checkpoints (keep only best_model.pth)
-    for fold_num in range(1, args.folds + 1):
-        fold_ckpt = os.path.join(args.ckpt_dir, f'fold{fold_num}_best.pth')
-        if os.path.exists(fold_ckpt):
-            os.remove(fold_ckpt)
-            print(f'  deleted fold{fold_num}_best.pth')
-
     set_seed(args.seed)
-
     test_ds     = VesselDataset(test_pairs, augment=False, seed=args.seed,
                                 sharp_hann=not args.plain_hann)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size,
-                             shuffle=False, num_workers=args.num_workers, pin_memory=True,
-                             persistent_workers=True,
-                             collate_fn=collate_fn_with_filenames)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                             num_workers=args.num_workers, pin_memory=True,
+                             persistent_workers=True, collate_fn=collate_fn_with_filenames)
 
-    model = create_model(device)
-    model.load_state_dict(torch.load(os.path.join(args.ckpt_dir, 'best_model.pth'),
-                                     map_location=device))
-    criterion = VesselLoss(lambda_cldice=args.lambda_cldice,
+    model = create_model(device, ckpt_path=os.path.join(args.ckpt_dir, 'best_model.pth'))
+    criterion = VesselLoss(lambda_tversky=args.lambda_tversky,
+                           lambda_cldice=args.lambda_cldice,
+                           lambda_skel_density=args.lambda_skel_density,
                            tversky_beta=args.tversky_beta)
 
-    te_loss, te_parts = run_epoch(model, test_loader, criterion,
-                                   None, None, device, train=False)
-    print(f'Test loss {te_loss:.4f} '
-          f'(tversky={te_parts["tversky"]:.3f} cldice={te_parts["cldice"]:.3f})')
+    te_loss, te_parts, te_dice = run_epoch(model, test_loader, criterion,
+                                           None, None, device, train=False)
+    print(f'Test loss {te_loss:.4f} dice={te_dice:.4f} '
+          f'(tv={te_parts["tversky"]:.3f} cl={te_parts["cldice"]:.3f} sd={te_parts["skel_density"]:.3f})')
 
-    # ── Stitched-image Dice on test set (interpretable 0-1 metric) ────────────
-    # te_loss above is computed on tile-level patches with Hanning weighting,
-    # so its components fall outside [0, 1]. To report a standard Dice score,
-    # run inference on each full test image (predict_image stitches tiles back
-    # into a (H, W) binary mask) and compare against the ground-truth mask.
     print('\nStitched-image Dice on test set:')
     dice_per_image = []
     for img_path, msk_path in test_pairs:
-        pred_mask = predict_image(model, img_path, device)
-        gt_mask   = tif_imread(msk_path) > 0                       # (H, W) bool
-        inter     = float(np.logical_and(pred_mask, gt_mask).sum())
-        denom     = float(pred_mask.sum() + gt_mask.sum())
-        dice      = (2.0 * inter) / (denom + 1e-8)                 # standard Dice ∈ [0, 1]
+        mask, _ = predict_image(model, img_path, device)
+        gt_mask  = tif_imread(msk_path) > 0
+        inter    = float(np.logical_and(mask, gt_mask).sum())
+        denom    = float(mask.sum() + gt_mask.sum())
+        dice     = (2.0 * inter) / (denom + 1e-8)
         dice_per_image.append(dice)
-        print(f'  {os.path.basename(img_path):40s} dice = {dice:.4f}')
-    mean_test_dice = float(np.mean(dice_per_image))
-    print(f'Mean test Dice (stitched, unweighted): {mean_test_dice:.4f}')
+        print(f'  {os.path.basename(img_path):40s}  dice={dice:.4f}')
+
+    mean_dice = float(np.mean(dice_per_image))
+    print(f'Mean test Dice: {mean_dice:.4f}')
 
     wandb.log({
-        "test/loss":             te_loss,
-        "test/tversky":          te_parts["tversky"],
-        "test/cldice":           te_parts["cldice"],
-        "test/dice_stitched":    mean_test_dice,        # standard Dice ∈ [0, 1] — clinically interpretable
-        "best_fold":             best_fold,
-        "cv_mean_val_loss":      float(np.mean(best_loss_folds)),
-        "cv_std_val_loss":       float(np.std(best_loss_folds)),
+        "test/loss":          te_loss,
+        "test/dice":          te_dice,
+        "test/tversky":       te_parts["tversky"],
+        "test/cldice":        te_parts["cldice"],
+        "test/skel_density":  te_parts["skel_density"],
+        "test/dice_stitched": mean_dice,
+        "best_fold":          best_fold,
+        "cv_mean_val_loss":   float(np.mean(best_loss_folds)),
+        "cv_std_val_loss":    float(np.std(best_loss_folds)),
     })
-    wandb.finish()   # marks the run complete and uploads any remaining data
+
+    wandb_run_dir = os.path.dirname(wandb.run.dir)
+    wandb.finish()
+    shutil.rmtree(wandb_run_dir, ignore_errors=True)
 
     print_cv_summary(
         folds            = args.folds,
@@ -383,8 +390,6 @@ def main(args):
 if __name__ == '__main__':
     import yaml
 
-    # Two-pass parse: first read --config path, load YAML, then set those values
-    # as argparse defaults so any explicit CLI flag still overrides the config.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None)
     pre_args, _ = pre.parse_known_args()
@@ -396,7 +401,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     # ── Paths (cluster-specific; always set via CLI or submit.sh) ─────────────
-    parser.add_argument('--config',       default=None,  help='Path to YAML experiment config')
+    parser.add_argument('--config',       default=None)
     parser.add_argument('--input_dir',    required=True)
     parser.add_argument('--output_dir',   required=True)
     parser.add_argument('--ckpt_dir',     default='../checkpoints')
@@ -409,27 +414,26 @@ if __name__ == '__main__':
     parser.add_argument('--n_folds',      type=int,   default=5)
     parser.add_argument('--test_split',   type=float, default=0.2)
     parser.add_argument('--folds',        type=int,   default=5,
-                        help='Train at most this many folds (still uses n_folds-way 80/20 split)')
+                        help='Train at most this many folds (still uses n_folds-way split)')
     parser.add_argument('--patience',     type=int,   default=30)
     # ── Training loop ─────────────────────────────────────────────────────────
-    parser.add_argument('--epochs',       type=int,   default=200)
+    parser.add_argument('--epochs',       type=int,   default=150)
     parser.add_argument('--batch_size',   type=int,   default=2)
     parser.add_argument('--lr',           type=float, default=1e-4)
     parser.add_argument('--num_workers',  type=int,   default=8)
     # ── Loss weights ──────────────────────────────────────────────────────────
-    parser.add_argument('--lambda_cldice',   type=float, default=1.0,
-                        help='Weight on clDice topology loss.')
-    # Tversky beta: FN weight. alpha is derived as (1 - beta) so alpha + beta = 1 always.
-    # beta=0.5 → standard Dice. beta=0.7 → penalises missed vessels 2.3× more than FP.
-    # Increase beta (e.g. 0.8) to recover more thin vessels at the cost of more FP.
-    parser.add_argument('--tversky_beta',    type=float, default=0.7,
-                        help='Tversky FN weight; alpha = 1 - beta is derived automatically.')
+    parser.add_argument('--warmstart_ckpt',  default=None,
+                        help='Checkpoint to warmstart all folds from (e.g. best_model.pth from a prior run).')
+    parser.add_argument('--lambda_tversky',      type=float, default=1.0)
+    parser.add_argument('--lambda_cldice',       type=float, default=0.0)   # disabled; enable for topology
+    parser.add_argument('--lambda_skel_density', type=float, default=0.0)   # disabled; enable for blob penalty
+    parser.add_argument('--tversky_beta',        type=float, default=0.5,
+                        help='FN weight β; α=1−β derived. 0.5=Dice, >0.5 penalises FN more.')
     # ── Dataset / augmentation ────────────────────────────────────────────────
     parser.add_argument('--plain_hann',     action='store_true')
     parser.add_argument('--blur_prob',      type=float, default=0.3)
     parser.add_argument('--blur_sigma_max', type=float, default=4.0)
-    # YAML config values become defaults; explicit CLI flags still override.
-    # Exclude path args — those are always cluster-specific and set via CLI.
+
     parser.set_defaults(**{k: v for k, v in cfg.items()
                            if k not in ('input_dir', 'output_dir', 'ckpt_dir')})
     args = parser.parse_args()

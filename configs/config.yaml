@@ -1,43 +1,33 @@
-# Experiment E: Attention UNet with ResNet34 encoder
-# Goal: explore alternative encoder-decoder architecture with attention gates for blurry region suppression
-# Architecture: ResNet34 (trainable, ImageNet pretrained) + UNet decoder + attention gates at skip connections
-# Expected: 40-60 sec/epoch (vs 105 sec with SAM2) → allows 400+ epochs in 8h budget
+# AttentionUNet vessel segmentation — all hyperparameters live here
 
-# ── W&B logging (train.py → wandb.init) ───────────────────────────────────────
+# ── W&B logging ───────────────────────────────────────────────────────────────
 wandb_entity:  "eeebashit"
 wandb_project: "vessel-seg"
 
-# ── Reproducibility (train.py → set_seed) ─────────────────────────────────────
+# ── Reproducibility ───────────────────────────────────────────────────────────
 seed: 42
 
-# ── Cross-validation (train.py → KFold, train_test_split) ────────────────────
+# ── Cross-validation ──────────────────────────────────────────────────────────
 n_folds:    5
 test_split: 0.2
 folds:      5
 patience:   30
 
-# ── Training loop (train.py → DataLoader, AdamW, scheduler) ──────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 epochs:      150
-batch_size:  12          # 1.5× original 8, safe margin for cldice_loss soft_skeletonize
+batch_size:  10
 lr:          0.0001
 num_workers: 8
 
-# ── Loss weights (train.py → loss.py VesselLoss) ─────────────────────────────
-lambda_cldice:   1.0
-# Tversky beta: FN weight. alpha = 1 - beta is derived automatically (alpha + beta = 1).
-# beta=0.5 → Dice. beta=0.7 → penalises missed vessels 2.3× more than FP.
-tversky_beta:    0.7
+# ── Loss weights (VesselLoss) ─────────────────────────────────────────────────
+lambda_tversky:       1.0
+lambda_cldice:        0.0   # disabled — enable for topology-aware training
+lambda_skel_density:  0.0   # disabled — enable for blob-penalty training
+tversky_beta:         0.5   # 0.5 = Dice; 0.7 = FN penalised 2.3× more than FP
 
-# ── Model architecture (train.py → model_type) ───────────────────────────────
-model_type: attention_unet   # ResNet34 encoder + UNet decoder + attention gates
-                             # Fully trainable (no frozen backbone)
-                             # Attention gates suppress low-activation (blurry) regions
-                             # 3-channel input: [gray, grad_mag, sharpness] natively supported
-
-# ── Hanning gate (train.py → VesselDataset) ──────────────────────────────────
+# ── Hanning gate ──────────────────────────────────────────────────────────────
 plain_hann: false
 
-# ── Blur augmentation (train.py → VesselDataset → dataset.py _augment()) ──────
-blur_prob:      0.3          # same as exp_A — isolates architecture effect
+# ── Blur augmentation ─────────────────────────────────────────────────────────
+blur_prob:      0.3
 blur_sigma_max: 4.0
-sam2_local_dir: null         # not used for attention_unet model_type

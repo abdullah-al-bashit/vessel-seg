@@ -52,9 +52,9 @@ echo "Start:     $(date)"
 # data_splits.json (next to CKPT_PATH) tags each W&B Media caption as [test] or [trainval].
 INPUT_DIR="data/images"
 MASK_DIR="data/masks"      # for TP/FP/FN error overlay; omit to skip
-# CKPT_PATH is set by submit.sh via --export=ALL,CKPT_PATH=checkpoints/<job_id>/fold1_best.pth
+# CKPT_PATH is set by submit_train.sh via --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth
 # The fallback is for manual runs only — in normal usage this is always set by the training job.
-CKPT_PATH="${CKPT_PATH:-checkpoints/fold1_best.pth}"
+CKPT_PATH="${CKPT_PATH:-checkpoints/best_model.pth}"
 OUT_DIR="predictions"
 
 # ── Predict ────────────────────────────────────────────────────────────────────

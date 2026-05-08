@@ -193,21 +193,18 @@ class VesselDataset(Dataset):
             msk  = (msk > 0).astype(np.uint8)
 
             for img_tile, msk_tile, _ in tile_image(img, msk):
-                # Resize tile to (TILE_H, TILE_W) if needed for SAM2
                 if img_tile.shape != (TILE_H, TILE_W):
                     img_tile = _pad_tile(img_tile, TILE_H, TILE_W)
                     msk_tile = _pad_tile(msk_tile, TILE_H, TILE_W)
 
                 sharp  = compute_sharpness(img_tile)              # (H, W) float32 [0,1]
                 grad   = compute_gradient_magnitude(img_tile)     # (H, W) float32 [0,1]
-                # sharp_hann=True: blurry pixels downweighted (model ignores blur).
-                # sharp_hann=False: plain hanning so model trains equally on blurry regions.
-                hann_w = hann * sharp if sharp_hann else hann
-
+                # Store plain Hanning — sharpness gate applied once in __getitem__
+                # so augmentation doesn't cause a double-sharpness multiply (w²).
                 self.items.append((
                     img_tile.copy(),
                     msk_tile.copy(),
-                    hann_w.copy(),
+                    hann.copy(),   # plain Hanning; __getitem__ multiplies by sharp when sharp_hann=True
                     sharp.copy(),
                     grad.copy(),
                     fname,
@@ -226,8 +223,11 @@ class VesselDataset(Dataset):
                                 blur_sigma_max=self.blur_sigma_max)
             sharp = compute_sharpness(img)
             grad  = compute_gradient_magnitude(img)
-            if self.sharp_hann:
-                hann = hann * sharp / (sharp.max() + 1e-8)  # re-weight hanning post-augment
+
+        # Apply sharpness gate once (after any augmentation) using current sharp map.
+        # hann stored in items is always plain Hanning to avoid double-multiply.
+        if self.sharp_hann:
+            hann = hann * sharp / (sharp.max() + 1e-8)
 
         img_t   = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
         msk_t   = torch.from_numpy(msk.astype(np.float32)).unsqueeze(0)

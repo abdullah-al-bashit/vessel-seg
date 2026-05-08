@@ -30,16 +30,14 @@ def tversky_loss(pred, target, weight=None, alpha=0.3, beta=0.7, eps=1e-6):
     pred   = pred.contiguous().view(pred.size(0), -1)    # (B, H*W)
     target = target.contiguous().view(target.size(0), -1)  # (B, H*W)
 
-    if weight is not None:
-        # Gate each pixel by its Hanning weight so tile-edge pixels
-        # contribute less to the loss than center pixels.
-        w      = weight.contiguous().view(weight.size(0), -1)  # (B, H*W)
-        pred   = pred * w    # (B, H*W)
-        target = target * w  # (B, H*W)
+    # w=1 when no Hanning gate → standard Tversky/Dice formula.
+    # Weight each term directly; do NOT pre-multiply pred and target by w first —
+    # that introduces w² in TP and corrupts FP/FN via (1-target·w) ≠ (1-target)·w.
+    w  = weight.contiguous().view(weight.size(0), -1) if weight is not None else 1.0
+    tp = (pred * target       * w).sum(dim=1)  # (B,)
+    fp = (pred * (1 - target) * w).sum(dim=1)  # (B,)
+    fn = ((1 - pred) * target * w).sum(dim=1)  # (B,)
 
-    tp    = (pred * target).sum(dim=1)               # (B,) true positives
-    fp    = (pred * (1 - target)).sum(dim=1)          # (B,) false positives
-    fn    = ((1 - pred) * target).sum(dim=1)          # (B,) false negatives
     return (1.0 - (tp + eps) / (tp + alpha * fp + beta * fn + eps)).mean()  # scalar
 
 
@@ -86,59 +84,82 @@ def soft_skeletonize(img, iters=10):
     return skel                             # (B, 1, H, W)
 
 
-def cldice_loss(pred_prob, target, weight=None, eps=1e-6):
+def cldice_loss(pred_prob, target, weight=None, iters=5, eps=1e-6):
     """
-    Centerline Dice loss — topology-aware.
+    Centerline Dice loss (clDice) — topology-aware F1 of skeleton precision × sensitivity.
+
+    iters=5 halves pooling intermediates vs 10 while still producing a usable centerline.
+
     pred_prob: (B, 1, H, W)  sigmoid probabilities
     target:    (B, 1, H, W)  binary float
-    weight:    (B, 1, H, W)  Hanning gate
+    weight:    (B, 1, H, W)  Hanning gate (or None)
     """
-    # Extract centerline of prediction and ground truth independently.
-    # Skeletonizing both ensures the loss penalises topology errors
-    # (broken vessels, false connections) rather than boundary imprecision.
-    skel_pred   = soft_skeletonize(pred_prob)  # (B, 1, H, W)
-    skel_target = soft_skeletonize(target)     # (B, 1, H, W)
+    # float32 cast: AMP/autocast gives float16 where erod−opened ≈ 1e-4 rounds to 0,
+    # making skel_pred=0 → gradient vanishes. float32 preserves sub-millipoint diffs.
+    pred_f32   = pred_prob.float()
+    target_f32 = target.float()
+    w          = weight.float() if weight is not None else 1.0
 
-    if weight is not None:
-        # Apply Hanning gate before computing dot products so tile-edge
-        # skeleton pixels don't bias the topology score.
-        pred_prob   = pred_prob   * weight  # (B, 1, H, W)
-        target      = target      * weight  # (B, 1, H, W)
-        skel_pred   = skel_pred   * weight  # (B, 1, H, W)
-        skel_target = skel_target * weight  # (B, 1, H, W)
+    skel_pred   = soft_skeletonize(pred_f32,   iters=iters)  # (B, 1, H, W) float32
+    skel_target = soft_skeletonize(target_f32, iters=iters)  # (B, 1, H, W) float32; no backprop
 
-    # Topology precision: how much of the predicted skeleton overlaps the GT mask.
-    # Low t_prec → predicted centerline runs outside the true vessel.
-    t_prec = ((skel_pred   * target).sum()    + eps) / (skel_pred.sum()    + eps)  # scalar
-    # Topology sensitivity: how much of the GT skeleton is covered by the prediction.
-    # Low t_sens → true vessel centerline is missed (broken/absent vessels).
-    t_sens = ((skel_target * pred_prob).sum() + eps) / (skel_target.sum() + eps)   # scalar
-
-    # F1 of the two topology scores, subtracted from 1 to form a loss.
+    # Standard clDice formula from Shit et al. 2021.
+    t_prec = ((skel_pred   * target_f32 * w).sum() + eps) / ((skel_pred   * w).sum() + eps)
+    t_sens = ((skel_target * pred_f32   * w).sum() + eps) / ((skel_target * w).sum() + eps)
     return 1.0 - 2.0 * (t_prec * t_sens) / (t_prec + t_sens + eps)  # scalar
+
+
+# ── Skeleton Density Loss ──────────────────────────────────────────────────────
+
+def skeleton_density_loss(pred_prob, target, weight=None, iters=5, eps=1e-6):
+    """
+    FN skeleton density: penalises blob-shaped missed vessel branches.
+
+    Operates on the FN region (1−pred)×target (pixels the model misses).
+      thin missed vessel  → thin FN  → high density → loss≈0
+      large missed branch → blob FN  → low density  → loss≈1
+
+    Per-image density then mean: each image contributes equally regardless of FN area.
+    Empty FN (no misses): fn_sum≈0 → density=eps/eps=1 → loss=0.
+    """
+    pred_f32   = pred_prob.float()
+    target_f32 = target.float()
+    w          = weight.float() if weight is not None else 1.0
+
+    fn_pred  = (1.0 - pred_f32) * target_f32                  # (B, 1, H, W)
+    skel_fn  = soft_skeletonize(fn_pred, iters=iters)          # (B, 1, H, W)
+    skel_sum = (skel_fn * w).sum(dim=(1, 2, 3))                # (B,)
+    fn_sum   = (fn_pred * w).sum(dim=(1, 2, 3))                # (B,)
+    return (1.0 - (skel_sum + eps) / (fn_sum + eps)).mean()    # scalar
 
 
 # ── Combined Gated Loss ────────────────────────────────────────────────────────
 
 class VesselLoss(nn.Module):
     """
-    L = Tversky(pred, gt, W) + λ_cl·clDice(pred, gt, W)
+    L = λ_tv·Tversky(pred, gt, W) + λ_cl·clDice(pred, gt, W) + λ_sd·SkelDensity(pred, gt, W)
 
-    Tversky (α=0.3, β=0.7) penalises FN 2.3× more than FP to recover missed thin vessels.
-    clDice preserves vessel topology and connectivity.
-    BCE dropped: Tversky already subsumes its signal, and hard-neg mining competed with
-    the FN-recovery goal by pushing gradients in the opposite direction.
+    All three terms are independently weighted; set any λ to 0 to disable.
+    Current defaults: only Tversky active (λ_cl=0, λ_sd=0).
+
+    Tversky: TP / (TP + α·FP + β·FN),  α = 1 − β
+      β=0.5  → standard Dice
+      β>0.5  → penalises missed vessels more than false alarms
 
     Hyperparameters:
-      lambda_cldice  weight on clDice               default 1.0
-      tversky_beta   FN weight in Tversky denominator  default 0.7
-                     alpha is derived as (1 - beta) so alpha + beta = 1 always holds
+      lambda_tversky      default 1.0
+      lambda_cldice       default 0.0  (disabled — enable for topology training)
+      lambda_skel_density default 0.0  (disabled — enable for blob-penalty training)
+      tversky_beta        default 0.5
     """
-    def __init__(self, lambda_cldice=1.0, tversky_beta=0.7):
+    def __init__(self, lambda_tversky=1.0, lambda_cldice=0.0,
+                 lambda_skel_density=0.0, tversky_beta=0.5):
         super().__init__()
-        self.lam           = lambda_cldice
-        self.tversky_beta  = tversky_beta          # FN weight: higher → penalise missed vessels more
-        self.tversky_alpha = 1.0 - tversky_beta    # FP weight: derived so alpha + beta = 1
+        self.lam_tversky     = lambda_tversky
+        self.lam_cldice      = lambda_cldice
+        self.lam_skel_density = lambda_skel_density
+        self.tversky_beta    = tversky_beta
+        self.tversky_alpha   = 1.0 - tversky_beta
 
     def forward(self, logits, target, hann_weight):
         """
@@ -146,16 +167,17 @@ class VesselLoss(nn.Module):
         target:      (B, 1, H, W)   binary float mask
         hann_weight: (B, 1, H, W)   Hanning × sharpness gate
         """
-        pred = torch.sigmoid(logits)  # (B, 1, H, W)
+        pred = torch.sigmoid(logits)
 
-        l_tversky = tversky_loss(pred, target, hann_weight,
-                                 alpha=self.tversky_alpha,
-                                 beta=self.tversky_beta)   # asymmetric FN penalty
-        l_cl      = cldice_loss(pred, target, hann_weight) # topology / connectivity
+        l_tv = (tversky_loss(pred, target, hann_weight,
+                             alpha=self.tversky_alpha, beta=self.tversky_beta)
+                if self.lam_tversky > 0 else pred.new_zeros(1))
 
-        total = l_tversky + self.lam * l_cl
+        l_cl = (cldice_loss(pred, target, hann_weight)
+                if self.lam_cldice > 0 else pred.new_zeros(1))
 
-        return total, {
-            'tversky': l_tversky.item(),
-            'cldice':  l_cl.item(),
-        }
+        l_sd = (skeleton_density_loss(pred, target, hann_weight)
+                if self.lam_skel_density > 0 else pred.new_zeros(1))
+
+        total = self.lam_tversky * l_tv + self.lam_cldice * l_cl + self.lam_skel_density * l_sd
+        return total, {'tversky': l_tv.item(), 'cldice': l_cl.item(), 'skel_density': l_sd.item()}, pred

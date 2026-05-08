@@ -1,54 +1,39 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
-# Local weights file — download once with scripts/download_weights.sh so every
-# job loads from disk instead of re-downloading from HuggingFace per node.
-_RESNET34_WEIGHTS = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'weights', 'resnet34_pretrained.pth'
-)
+import timm
 
 
-def _load_resnet34_encoder(in_chans=3, out_indices=(0, 1, 2, 3, 4)):
-    """Load ResNet34 encoder, preferring a local weights file over HF download."""
-    import timm
-    if os.path.exists(_RESNET34_WEIGHTS):
-        print(f'Loading ResNet34 weights from {_RESNET34_WEIGHTS}')
-        encoder = timm.create_model('resnet34', pretrained=False,
-                                    features_only=True, in_chans=in_chans,
-                                    out_indices=out_indices)
-        encoder.load_state_dict(torch.load(_RESNET34_WEIGHTS, map_location='cpu', weights_only=True))
-    else:
-        print('weights/resnet34_pretrained.pth not found — downloading from HuggingFace and saving locally...')
-        encoder = timm.create_model('resnet34', pretrained=True,
-                                    features_only=True, in_chans=in_chans,
-                                    out_indices=out_indices)
-        os.makedirs(os.path.dirname(_RESNET34_WEIGHTS), exist_ok=True)
-        torch.save(encoder.state_dict(), _RESNET34_WEIGHTS)
-        print(f'Saved → {_RESNET34_WEIGHTS}')
-    return encoder
+def _build_resnet34_encoder(in_chans=3, out_indices=(0, 1, 2, 3, 4)):
+    """Build ResNet34 encoder architecture with random weights. Weight loading is handled by create_model."""
+    return timm.create_model('resnet34', pretrained=False,
+                             features_only=True, in_chans=in_chans,
+                             out_indices=out_indices)
 
 
 class AttentionGate(nn.Module):
     """Gating mechanism: soft attention on skip-connection features guided by decoder query."""
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
-        self.W_g = nn.Conv2d(F_g, F_int, 1, padding=0)
-        self.W_x = nn.Conv2d(F_l, F_int, 1, padding=0)
-        self.psi = nn.Conv2d(F_int, 1, 1, padding=0)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
+        self.W_g   = nn.Conv2d(F_g,   F_int, 1, padding=0)
+        self.W_x   = nn.Conv2d(F_l,   F_int, 1, padding=0)
+        # BN before sigmoid recenters pre-activation distribution so the gate
+        # suppresses ~half of spatial locations rather than saturating to 1 everywhere.
+        self.psi   = nn.Sequential(
+            nn.Conv2d(F_int, 1, 1, padding=0),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid(),
+        )
+        self.relu  = nn.ReLU(inplace=True)
 
     def forward(self, g, x):
         g1 = self.W_g(g)
         # Resize g1 to match x spatial dimensions (handle mismatch from uneven upsampling)
         if g1.shape[2:] != x.shape[2:]:
             g1 = F.interpolate(g1, size=x.shape[2:], mode='bilinear', align_corners=False)
-        x1 = self.W_x(x)
-        psi = self.sigmoid(self.psi(self.relu(g1 + x1)))
+        x1  = self.W_x(x)
+        psi = self.psi(self.relu(g1 + x1))
         self.last_psi = psi.detach()  # Save for visualization (no grad overhead)
         return x * psi
 
@@ -67,7 +52,7 @@ class AttentionUNet(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.encoder = _load_resnet34_encoder()
+        self.encoder = _build_resnet34_encoder()
 
         # ── Skip-connection attention gates (encoder scale → decoder query) ──────
         # e0 is 64ch but d1 (decoder at H/2) is 32ch — project before attention + add

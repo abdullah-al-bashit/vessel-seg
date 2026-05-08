@@ -25,43 +25,32 @@ def predict_image(model, img_path, device):
     2. Tile horizontally
     3. Forward pass per tile
     4. Stitch overlapping tiles
-    5. Postprocess
 
-    Returns: (H, W) bool binary mask
+    Returns: (mask, img_tile)
+      mask:     (H, W) bool
+      img_tile: last tile numpy array; model.last_psi matches it
     """
     img_raw  = imread(img_path)
     img_u8   = normalize(img_raw)               # (H, W) uint8
     H, W     = img_u8.shape[:2]
 
-    tiles    = tile_image(img_u8)               # list of (img_tile, x_offset)
-    tile_probs = []
-    tile_xs    = []
+    tiles = tile_image(img_u8)
+    probs = []
+    tile_xs = []
 
     model.eval()
     with torch.no_grad():
         for img_tile, x_off in tqdm(tiles, desc='tiles', leave=False):
-            t = torch.from_numpy(
-                    img_tile.astype(np.float32) / 255.0
-                ).unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, H, W)
-
-            sharp   = compute_sharpness(img_tile)
-            grad    = compute_gradient_magnitude(img_tile)
-            sharp_t = torch.from_numpy(sharp).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
-            grad_t  = torch.from_numpy(grad).unsqueeze(0).unsqueeze(0).to(device)   # (1,1,H,W)
-            logits = model(t, sharpness=sharp_t, grad_mag=grad_t)  # (1, 1, H, W)
-            prob   = torch.sigmoid(logits).squeeze().cpu().numpy()  # (H, W)
-            tile_probs.append(prob)
+            t       = torch.from_numpy(img_tile.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+            sharp_t = torch.from_numpy(compute_sharpness(img_tile)).unsqueeze(0).unsqueeze(0).to(device)
+            grad_t  = torch.from_numpy(compute_gradient_magnitude(img_tile)).unsqueeze(0).unsqueeze(0).to(device)
+            prob    = torch.sigmoid(model(t, sharpness=sharp_t, grad_mag=grad_t))
+            probs.append(prob.squeeze().cpu().numpy())
             tile_xs.append(x_off)
+    # img_tile retains last tile value after loop; model.last_psi matches it
 
-    # Stitch + threshold
-    mask = stitch_tiles(tile_probs, tile_xs, H, W)
-    return mask
-
-
-def create_model(device):
-    model = AttentionUNet().to(device)
-    print(f'AttentionUNet loaded: trainable ResNet34 encoder + UNet decoder with attention gates')
-    return model
+    mask = stitch_tiles(probs, tile_xs, H, W)
+    return mask, img_tile
 
 
 def main(args):
@@ -81,8 +70,10 @@ def main(args):
             if 'seed' in cfg:
                 seed = cfg['seed']
 
-    model = create_model(device)
-    model.load_state_dict(torch.load(args.ckpt_path, map_location=device, weights_only=True))
+    model = AttentionUNet().to(device)
+    print(f'AttentionUNet loaded: trainable ResNet34 encoder + UNet decoder with attention gates')
+    ckpt  = torch.load(args.ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['model_state_dict'] if isinstance(ckpt, dict) else ckpt)
     model.eval()
 
     # ** with recursive=True descends into subdirectories (D7/, D14/, D21/),
@@ -125,17 +116,16 @@ def main(args):
             "input_files": img_paths,    # exact list of images being predicted
         }
     )
-    print(f'Using model: {args.ckpt_path}')
+    print(f'Using checkpoint: {args.ckpt_path}')
     print(f'Images to predict: {len(img_paths)}')
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     for img_path in tqdm(img_paths, desc='images'):
-        fname = os.path.basename(img_path).replace('.tif', '_pred.tif')
+        fname    = os.path.basename(img_path).replace('.tif', '_pred.tif')
         out_path = os.path.join(args.out_dir, fname)
 
-        mask    = predict_image(model, img_path, device)
-        # Save raw mask to evaluate network output quality
+        mask, img_tile = predict_image(model, img_path, device)
         imwrite(out_path, (mask.astype(np.uint8) * 255))
         print(f'  saved → {out_path}')
 
@@ -164,13 +154,13 @@ def main(args):
         img_rgb  = np.stack([img_u8] * 3, axis=-1)            # (H, W, 3) grayscale → RGB
 
         # Color palette (high contrast on dark microscopy):
-        #   red   = "model predicted vessel" (prediction, FP)
-        #   green = "actual vessel"          (ground truth, TP)
-        #   cyan  = "missed vessel"          (FN)
-        RED, GREEN, CYAN = (
+        #   red    = "model predicted vessel" (prediction, FP)
+        #   green  = "actual vessel"          (ground truth, TP)
+        #   yellow = "missed vessel"          (FN)
+        RED, GREEN, YELLOW = (
             np.array([255,   0,   0]),
             np.array([  0, 220,   0]),
-            np.array([  0, 200, 255]),
+            np.array([255, 220,   0]),
         )
         alpha = 0.6
 
@@ -186,40 +176,46 @@ def main(args):
             fp = m  & ~gt_
             fn = ~m &  gt_
             c  = img_rgb.copy()
-            c[tp] = (alpha * GREEN + (1 - alpha) * c[tp]).astype(np.uint8)
-            c[fp] = (alpha * RED   + (1 - alpha) * c[fp]).astype(np.uint8)
-            c[fn] = (alpha * CYAN  + (1 - alpha) * c[fn]).astype(np.uint8)
+            c[tp] = (alpha * GREEN  + (1 - alpha) * c[tp]).astype(np.uint8)
+            c[fp] = (alpha * RED    + (1 - alpha) * c[fp]).astype(np.uint8)
+            c[fn] = (alpha * YELLOW + (1 - alpha) * c[fn]).astype(np.uint8)
             return c
+
+        grad_u8  = (compute_gradient_magnitude(img_u8) * 255).astype(np.uint8)
+        sharp_u8 = (compute_sharpness(img_u8)          * 255).astype(np.uint8)
 
         cap = f"[{label}] {fname}"
         log_payload = {
-            "originals":     wandb.Image(img_rgb, caption=cap),
-            "prediction":    wandb.Image(overlay(img_rgb, mask, RED),
-                                         caption=f"{cap}  |  raw network prediction (no postprocessing)"),
+            "originals":  wandb.Image(img_u8,   caption=f"{cap}  |  grayscale"),
+            "ch_grad":    wandb.Image(grad_u8,  caption=f"{cap}  |  gradient magnitude"),
+            "ch_sharp":   wandb.Image(sharp_u8, caption=f"{cap}  |  sharpness (VoL)"),
+            "prediction": wandb.Image(overlay(img_rgb, mask, RED),
+                                      caption=f"{cap}  |  prediction"),
         }
 
-        # If GT mask exists, log isolated TP/FP/FN panels to evaluate raw network output
+        # If GT mask exists, log isolated TP/FP/FN panels
         gt_path = img_to_mask.get(img_path)
         if gt_path:
             gt = imread(gt_path) > 0                          # (H, W) bool ground truth
             log_payload.update({
-                "gt":          wandb.Image(overlay(img_rgb, gt, GREEN),
-                                           caption=f"{cap}  |  green = ground-truth vessel"),
-                "tp":          wandb.Image(overlay(img_rgb, mask  &  gt, GREEN),
-                                           caption=f"{cap}  |  TP (raw)"),
-                "fp":          wandb.Image(overlay(img_rgb, mask  & ~gt, RED),
-                                           caption=f"{cap}  |  FP (raw)"),
-                "fn":          wandb.Image(overlay(img_rgb, ~mask &  gt, CYAN),
-                                           caption=f"{cap}  |  FN (raw)"),
-                "combined":    wandb.Image(make_combined(mask, gt),
-                                           caption=f"{cap}  |  raw  |  green=TP  red=FP  cyan=FN"),
+                "gt":       wandb.Image(overlay(img_rgb, gt, GREEN),
+                                        caption=f"{cap}  |  green = ground-truth vessel"),
+                "tp":       wandb.Image(overlay(img_rgb, mask  &  gt, GREEN),
+                                        caption=f"{cap}  |  TP"),
+                "fp":       wandb.Image(overlay(img_rgb, mask  & ~gt, RED),
+                                        caption=f"{cap}  |  FP"),
+                "fn":       wandb.Image(overlay(img_rgb, ~mask &  gt, YELLOW),
+                                        caption=f"{cap}  |  FN"),
+                "combined": wandb.Image(make_combined(mask, gt),
+                                        caption=f"{cap}  |  green=TP  red=FP  yellow=FN"),
             })
 
-        # Log attention maps (last tile's attention from AttentionUNet)
-        if hasattr(model, 'att1'):
-            attn_panels = visualize_attention_maps(model, img_rgb)
-            log_payload[f"attn/input_image"] = wandb.Image(img_rgb, caption=f"Input full image: {fname}")
-            log_payload.update({f"attn/{k}": v for k, v in attn_panels.items()})
+        # Attention maps: use the last tile's image — last_psi was saved during its forward pass.
+        # Using the full img_rgb would stretch one tile's attention map across the whole image.
+        tile_rgb    = np.stack([img_tile] * 3, axis=-1)
+        attn_panels = visualize_attention_maps(model, tile_rgb)
+        log_payload[f"attn/input_tile"] = wandb.Image(tile_rgb, caption=f"Last tile: {fname}")
+        log_payload.update({f"attn/{k}": v for k, v in attn_panels.items()})
 
         wandb.log(log_payload)
 
@@ -232,8 +228,8 @@ if __name__ == '__main__':
     parser.add_argument('--input_dir',  required=True)
     parser.add_argument('--ckpt_path',  required=True)
     parser.add_argument('--out_dir',    default='../predictions')
-    parser.add_argument('--mask_dir',     default=None,
+    parser.add_argument('--mask_dir',   default=None,
                         help='Optional ground-truth mask folder. If given, log a per-image '
-                             'TP/FP/FN error map (green/red/yellow) alongside the prediction.')
+                             'TP/FP/FN error map alongside the prediction.')
     args = parser.parse_args()
     main(args)

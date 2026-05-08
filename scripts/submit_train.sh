@@ -30,6 +30,10 @@ export PYTHONUNBUFFERED=1
 
 cd /home/$USER/vessel_seg
 
+# ── Clear wandb cache to prevent disk quota issues ────────────────────────────
+rm -rf /home/$USER/.cache/wandb/
+echo "Cleared ~/.cache/wandb/"
+
 # ── Verify GPU + CUDA ──────────────────────────────────────────────────────────
 echo "Job ID:    $SLURM_JOB_ID"
 echo "Node:      $SLURMD_NODENAME"
@@ -61,6 +65,7 @@ echo "CKPT_DIR:  $CKPT_DIR"
 # Environment vars override config values — useful for quick tests and GPU optimization:
 #   sbatch --export=ALL,EPOCHS=1 scripts/submit_train.sh
 #   sbatch --export=ALL,BATCH_SIZE=96,NUM_WORKERS=32 scripts/submit_train.sh
+#   sbatch --export=ALL,EPOCHS=20,FOLDS=1,LAMBDA_SKEL_DENSITY=0.5 scripts/submit_train.sh
 $PYTHON src/train.py \
     --config     $CONFIG    \
     --input_dir  $INPUT_DIR \
@@ -69,7 +74,12 @@ $PYTHON src/train.py \
     ${EPOCHS:+--epochs $EPOCHS} \
     ${FOLDS:+--folds $FOLDS} \
     ${BATCH_SIZE:+--batch_size $BATCH_SIZE} \
-    ${NUM_WORKERS:+--num_workers $NUM_WORKERS}
+    ${NUM_WORKERS:+--num_workers $NUM_WORKERS} \
+    ${WARMSTART_CKPT:+--warmstart_ckpt $WARMSTART_CKPT} \
+    ${LAMBDA_TVERSKY:+--lambda_tversky $LAMBDA_TVERSKY} \
+    ${LAMBDA_SKEL_DENSITY:+--lambda_skel_density $LAMBDA_SKEL_DENSITY} \
+    ${LAMBDA_CLDICE:+--lambda_cldice $LAMBDA_CLDICE} \
+    ${TVERSKY_BETA:+--tversky_beta $TVERSKY_BETA} \
 
 echo "Training done: $(date)"
 
@@ -81,4 +91,4 @@ PREDICT_JOB=$(sbatch --parsable \
     --dependency=afterok:$SLURM_JOB_ID \
     --export=ALL,CKPT_PATH=$CKPT_DIR/best_model.pth \
     scripts/submit_predict.sh)
-echo "Predict job submitted: $PREDICT_JOB  (ckpt: $CKPT_DIR/best_model.pth)"
+echo "Predict job submitted: $PREDICT_JOB  (checkpoint: $CKPT_DIR/best_model.pth)"
