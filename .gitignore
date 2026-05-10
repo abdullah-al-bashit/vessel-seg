@@ -49,6 +49,13 @@ wandb/
 # HuggingFace cache
 .cache/
 
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.toc
+vessel-seg-report/*.log
+
 # OS
 .DS_Store
 Thumbs.db
