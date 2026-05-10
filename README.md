@@ -1,6 +1,6 @@
-# Vessel Segmentation — SAM2.1 + ChebConv Graph Network
+# Vessel Segmentation — AttentionUNet
 
-Robust binary segmentation of blood vessels in single-channel fluorescence microscopy images using a joint CNN + Graph Neural Network decoder built on top of a frozen SAM2.1 (Hiera ViT-L) image encoder.
+Binary segmentation of blood vessels in single-channel fluorescence TIFF microscopy images using an Attention UNet with a trainable ResNet34 encoder.
 
 ---
 
@@ -10,38 +10,35 @@ Robust binary segmentation of blood vessels in single-channel fluorescence micro
 Raw fluorescence image  (H × W · uint16)
         │
         ▼
-Normalize  →  Strip tile 1024×1300  →  Hanning weight map
+Normalize → tile horizontally → [grayscale, gradient_magnitude, sharpness_map]
         │
         ▼
-Frozen SAM2.1 Hiera ViT-L encoder  (facebook/sam2.1-hiera-large)
-  Stage 1 · 2×  local attn
-  Stage 2 · 2×  + pool
-  Stage 3 · 11× + pool
-  Stage 4 · 2×  + pool
-  FPN neck · 4 scales · 256ch
+ResNet34 encoder (timm, ImageNet pretrained, fully trainable)
+  e0: (B,  64, H/2,  W/2)   ← stem, finest scale
+  e1: (B,  64, H/4,  W/4)   ← layer1
+  e2: (B, 128, H/8,  W/8)   ← layer2
+  e3: (B, 256, H/16, W/16)  ← layer3
+  e4: (B, 512, H/32, W/32)  ← layer4, coarsest scale
         │
-        ├──────────────────────────────────┐
-        │                                  │
-   CNN upsampling                    Graph construction
-   ConvT 2× · 256→64ch               coarse mask → skeletonize
-   ConvT 2× · 64→32ch                extract G=(V,E) via sknw
-   F_pixel (H×W×32)                  anisotropic node features:
-                                        (x, y, cosθ, sinθ, d, κ)
-                                      edge features: (Δθ, length, gap_int)
-                                      ChebConv(K=10) × 3 layers
-                                      F_graph (N×64)
-        │                                  │
-        └──────── F_fused = F_pixel + scatter(F_graph) ──────┘
-                                    │
-                              Conv 1×1 → logits
-                                    │
-                        Loss: Dice + BCE + clDice  (Hanning-gated)
-                                    │
-                              Binary mask (H × W)
-                                    │
-                        Postprocess: rm small obj · fill holes
-                                    │
-                        GAT topology refinement  (optional)
+        ▼
+UNet decoder with AttentionGates on all skip connections
+  d4: up4(e4)       + att1(d4, e3)    → (B, 256, H/16, W/16)
+  d3: up3(d4+att1)  + att2(d3, e2)   → (B, 128, H/8,  W/8)
+  d2: up2(d3+att2)  + att3(d2, e1)   → (B,  64, H/4,  W/4)
+  d1: up1(d2+att3)  + att0(d1, e0)   → (B,  32, H/2,  W/2)
+  d0: up0(d1+att0)                   → (B,  16, H,     W)
+        │
+        ▼
+Dilated refinement head (dilation=2 → 9×9 receptive field)
+        │
+        ▼
+Conv 1×1 → logits (B, 1, H, W)
+        │
+        ▼
+Loss: Tversky (β=0.7 penalises missed vessels) + optional clDice + skel_density
+        │
+        ▼
+Binary mask (H × W)
 ```
 
 ---
@@ -50,87 +47,91 @@ Frozen SAM2.1 Hiera ViT-L encoder  (facebook/sam2.1-hiera-large)
 
 | Choice | Reason |
 |---|---|
-| Frozen SAM2.1 encoder | 11M image pretrain — illumination invariant, no preprocessing needed |
-| HuggingFace `from_pretrained` | No manual checkpoint download, auto-cached to scratch |
-| Strip tiling `1024 × full_height` | No vertical vessel cuts — panoramic images are ~15800×1300px |
-| Hanning loss gate | Boundary pixels at tile edges never contribute to loss — prevents broken-vessel learning |
-| 50% tile overlap + average stitching | Every pixel seen near-center in at least one tile |
-| ChebConv K=10 | 10-hop receptive field captures full vessel length regardless of pixel distance |
-| Anisotropic node features (θ, d, κ) | Direction-aware — fixes GCN isotropy problem for tubular structures |
-| Dice + BCE + clDice | Pixel accuracy + topology correctness dual objective |
-| Per-image min-max normalization | No pixel removal, handles any bit depth or acquisition |
+| 3-channel input [gray, grad_mag, sharpness] | Explicit texture cues beyond raw intensity |
+| Trainable ResNet34 encoder | Adapts to fluorescence domain; ImageNet weights as starting point |
+| AttentionGate on all 4 skip connections | Suppresses irrelevant background features at every decoder scale |
+| Dilated refinement head (d=2) | 9×9 effective receptive field fills vessel gaps before final projection |
+| Tversky loss (α=0.3, β=0.7) | Penalises missed vessels 2.3× more than false positives |
+| Hanning loss gate | Tile-boundary pixels never contribute to loss — prevents broken-vessel learning |
+| Horizontal tiling + overlap stitching | No vertical vessel cuts on panoramic ~15800×1300 px images |
+| Per-image min-max normalization | Handles any bit depth or acquisition settings |
 
 ---
 
 ## Dataset
 
-- 45 single-channel fluorescence `.tif` images
-- 30 annotated with binary masks (`255` = vessel lumen, `0` = vessel walls)
-- 15 unannotated (used for pseudo-labeling after training)
-- Image resolution: ~15800 × 1300 px · uint16 · 12-bit effective range
+- Fluorescence `.tif` images, ~15800 × 1300 px, uint16
+- Binary masks: `255` = vessel lumen, `0` = background/walls
 
-Expected directory layout:
+Expected layout:
 
 ```
-project/
-├── Input/
-│   ├── D7/     ← annotated raw images
-│   ├── D14/
-│   └── D21/
-├── Output/
-│   ├── D7/     ← binary masks matching Input/D7 by leading ID
-│   ├── D14/
-│   └── D21/
-├── Input_No_Masks/   ← 15 unlabeled images
-└── vessel_seg/       ← this repo
+data/
+├── images/    ← raw fluorescence images (.tif)
+└── masks/     ← binary masks matching images by filename
 ```
 
 ---
 
 ## Installation (NEU Explorer Cluster)
 
-**Step 1 — Start an interactive GPU session:**
-```bash
-srun --partition=gpu-interactive --gres=gpu:v100-sxm2:1 \
-     --cpus-per-task=4 --mem=16GB --time=01:00:00 --pty /bin/bash
-```
-
-**Step 2 — Run setup script (one time only):**
+**Step 1 — Create the conda environment (one time only):**
 ```bash
 bash scripts/setup_env.sh
 ```
 
-This creates the `vessel_seg` conda environment, installs all dependencies, and pre-downloads the SAM2.1 weights (~2.5 GB) into `/scratch/$USER/.cache/huggingface/`.
-
-**Step 3 — Edit email in SLURM scripts:**
+**Step 2 — Edit your email in the SLURM scripts:**
 ```bash
-# In scripts/submit.sh and scripts/submit_predict.sh:
+# In scripts/submit_train.sh and scripts/submit_predict.sh:
 #SBATCH --mail-user=YOUR_EMAIL@northeastern.edu
 ```
 
 ---
 
+## Configuration
+
+All hyperparameters live in [configs/config.yaml](configs/config.yaml) — nothing is hardcoded in `.py` files.
+
+```yaml
+n_folds:    5
+epochs:     100
+batch_size: 12
+lr:         0.0001
+patience:   30
+
+lambda_tversky:      1.0
+lambda_cldice:       0.0   # enable for topology-aware training
+lambda_skel_density: 0.0   # enable for blob-penalty training
+tversky_beta:        0.5   # 0.5 = Dice; 0.7 = FN penalised 2.3× more
+```
+
+Each run copies its config into `checkpoints/<SLURM_JOB_ID>/config.yaml`.
+
+---
+
 ## Usage
 
-### Train (5-fold cross-validation)
+### Train (K-fold cross-validation)
 
 ```bash
-sbatch scripts/submit.sh
+sbatch scripts/submit_train.sh
 ```
 
-Or manually:
+Override config values via environment variables:
 ```bash
-cd src
-python train.py \
-    --input_dir  ../../Input/D7  \
-    --output_dir ../../Output/D7 \
-    --ckpt_dir   ../checkpoints  \
-    --epochs     200             \
-    --batch_size 2               \
-    --lr         1e-4
+# Quick 1-epoch timing test
+sbatch --export=ALL,EPOCHS=1,FOLDS=1 scripts/submit_train.sh
+
+# Larger batch + more workers
+sbatch --export=ALL,BATCH_SIZE=16,NUM_WORKERS=8 scripts/submit_train.sh
+
+# Enable clDice loss
+sbatch --export=ALL,LAMBDA_CLDICE=0.3 scripts/submit_train.sh
 ```
 
-### Predict (15 unlabeled images)
+The predict job is automatically queued as a dependent SLURM job after training completes.
+
+### Predict
 
 ```bash
 sbatch scripts/submit_predict.sh
@@ -138,18 +139,18 @@ sbatch scripts/submit_predict.sh
 
 Or manually:
 ```bash
-cd src
-python predict.py \
-    --input_dir ../../Input_No_Masks    \
-    --ckpt_path ../checkpoints/fold1_best.pth \
-    --out_dir   ../predictions
+python src/predict.py \
+    --config     configs/config.yaml \
+    --input_dir  data/images \
+    --output_dir data/masks \
+    --ckpt_path  checkpoints/<job_id>/best_model.pth
 ```
 
-### Monitor training
+### Monitor
 
 ```bash
 squeue -u $USER
-tail -f logs/train_JOBID.out
+tail -f logs/train_<JOBID>.out
 ```
 
 ---
@@ -159,35 +160,36 @@ tail -f logs/train_JOBID.out
 ```
 vessel_seg/
 ├── src/
-│   ├── dataset.py       normalize · strip tiling · Hanning weight · VesselDataset
-│   ├── model.py         SAM2.1 encoder · CNN decoder · ChebConv graph decoder
-│   ├── loss.py          Dice + BCE + clDice · Hanning-gated
-│   ├── train.py         5-fold CV · AdamW · cosine LR · early stopping
-│   ├── predict.py       tile → forward → stitch → postprocess
-│   └── postprocess.py   cleanup + GAT topology refinement
+│   ├── model.py           AttentionUNet + AttentionGate + visualize_attention_maps
+│   ├── dataset.py         VesselDataset — tiling, sharpness, gradient magnitude, augmentation
+│   ├── loss.py            VesselLoss — Tversky + clDice + skel_density (Hanning-gated)
+│   ├── train.py           K-fold CV, AMP, W&B logging, early stopping
+│   ├── predict.py         tile → forward → stitch → W&B media log
+│   └── summarize_cv.py    print_cv_summary — publication-ready CV table
+├── configs/
+│   └── config.yaml        single experiment config (all hyperparameters)
 ├── scripts/
-│   ├── setup_env.sh     one-time env setup on Explorer
-│   ├── submit.sh        SLURM training job
-│   └── submit_predict.sh SLURM prediction job
-├── notebooks/
-│   └── visualize.ipynb  interactive overlay viewer (ipywidgets)
-├── checkpoints/         saved model weights (git-ignored)
-├── predictions/         output masks (git-ignored)
-├── logs/                SLURM logs (git-ignored)
+│   ├── setup_env.sh       one-time conda env setup on Explorer
+│   ├── submit_train.sh    SLURM train job (auto-queues predict on success)
+│   ├── submit_predict.sh  SLURM predict job
+│   └── visualize_d7_interactive.ipynb  interactive overlay viewer
+├── vessel-seg-report/     LaTeX report source + compiled PDF
+├── weights/               cached ResNet34 pretrained weights (git-ignored)
+├── checkpoints/           saved model weights per job ID (git-ignored)
+├── predictions/           output masks (git-ignored)
+├── logs/                  SLURM logs (git-ignored)
 ├── requirements.txt
-├── .gitignore
 └── README.md
 ```
 
 ---
 
-## Output Format
+## W&B Logging
 
-Predicted masks saved as uint8 TIFF files:
-- `255` = vessel lumen
-- `0` = vessel walls / background
-
-Filename format: `{original_name}_pred.tif`
+- **Entity**: `eeebashit` · **Project**: `vessel-seg`
+- Per-epoch: `fold{N}/train_{loss,tversky,cldice,boundary}` and validation metrics
+- Every 10 val epochs: attention maps (heatmap, overlay, alpha) for all 3 gates (att1, att2, att3)
+- Predict run: originals, prediction overlay, ground truth, TP/FP/FN panels, attention maps
 
 ---
 
@@ -198,18 +200,13 @@ Filename format: `{original_name}_pred.tif`
 | Dice coefficient | Pixel-level overlap |
 | clDice | Centerline topology — vessel connectivity |
 | Hausdorff (95%) | Worst-case boundary error |
-| AUC-PR | Threshold-independent performance |
 
 ---
 
-## Citation
+## Output Format
 
-If you use SAM2.1:
-```bibtex
-@article{ravi2024sam2,
-  title={SAM 2: Segment Anything in Images and Videos},
-  author={Ravi, Nikhila and others},
-  journal={arXiv preprint arXiv:2408.00714},
-  year={2024}
-}
-```
+Predicted masks saved as uint8 TIFF:
+- `255` = vessel lumen
+- `0` = background / vessel walls
+
+Filename format: `{original_name}_pred.tif`
