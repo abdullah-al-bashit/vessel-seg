@@ -50,12 +50,15 @@ echo "Start:     $(date)"
 # ── Paths ──────────────────────────────────────────────────────────────────────
 # Predicts on all .tif images in INPUT_DIR (test + trainval, recursively).
 # data_splits.json (next to CKPT_PATH) tags each W&B Media caption as [test] or [trainval].
-INPUT_DIR="data/images"
-MASK_DIR="data/masks"      # for TP/FP/FN error overlay; omit to skip
+# Defaults are used when running normally after training.
+# Override via --export to point at a different folder, e.g. for inference on new data:
+#   sbatch --export=ALL,CKPT_PATH=...,INPUT_DIR=inference_data/batch1,OUT_DIR=predictions/inference/batch1,INFERENCE_MODE=1 scripts/submit_predict.sh
+INPUT_DIR="${INPUT_DIR:-data/images}"
+MASK_DIR="${MASK_DIR:-data/masks}"     # for TP/FP/FN error overlay; omit to skip
 # CKPT_PATH is set by submit_train.sh via --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth
 # The fallback is for manual runs only — in normal usage this is always set by the training job.
 CKPT_PATH="${CKPT_PATH:-checkpoints/best_model.pth}"
-OUT_DIR="predictions"
+OUT_DIR="${OUT_DIR:-predictions}"
 
 # ── Predict ────────────────────────────────────────────────────────────────────
 $PYTHON src/predict.py \
