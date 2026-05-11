@@ -4,6 +4,7 @@ import json
 import argparse
 import yaml
 import random
+import time
 import numpy as np
 import torch
 from tifffile import imread, imwrite
@@ -126,7 +127,10 @@ def main(args):
     # Create top-level output directory if it does not yet exist
     os.makedirs(args.out_dir, exist_ok=True)
 
+    times = []   # per-image wall-clock seconds, used for summary at the end
+
     for img_path in tqdm(img_paths, desc='images'):
+        t0 = time.time()
         if args.inference_mode:
             # Mirror the subfolder structure from input_dir into out_dir.
             # e.g. inference_data/batch1/img.tif → predictions/inference/batch1/img_mask.tif
@@ -143,7 +147,9 @@ def main(args):
 
         mask, img_tile = predict_image(model, img_path, device)
         imwrite(out_path, (mask.astype(np.uint8) * 255))
-        print(f'  saved → {out_path}')
+        elapsed = time.time() - t0
+        times.append(elapsed)
+        print(f'  saved → {out_path}  (inference+save: {elapsed:.1f}s)')
 
         # W&B Media panels per image: originals, prediction, gt, tp, fp, fn,
         # combined. Each panel has its own step slider so you can isolate one
@@ -235,6 +241,13 @@ def main(args):
 
         wandb.log(log_payload)
 
+
+    if times:
+        print(f'\nInference+save timing — {len(times)} images:')
+        print(f'  avg per image: {sum(times)/len(times):.1f}s')
+        print(f'  min:           {min(times):.1f}s')
+        print(f'  max:           {max(times):.1f}s')
+        print(f'  total:         {sum(times):.1f}s')
 
     wandb.finish()   # marks predict run complete in the dashboard
 
