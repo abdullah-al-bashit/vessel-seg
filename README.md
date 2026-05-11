@@ -175,7 +175,7 @@ vessel_seg/
 │   ├── setup_env.sh       one-time conda env setup on Explorer
 │   ├── submit_train.sh    SLURM train job (auto-queues predict on success)
 │   ├── submit_predict.sh  SLURM predict job; handles inference via INFERENCE_MODE=1
-│   └── visualize_d7_interactive.ipynb  interactive overlay viewer
+│   └── overlay_inspector.ipynb         interactive overlay viewer for predictions
 ├── inference_data/        new images for inference — cluster only, git-ignored
 ├── vessel-seg-report/     LaTeX report source + compiled PDF
 ├── weights/               cached ResNet34 pretrained weights (git-ignored)
