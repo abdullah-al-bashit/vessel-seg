@@ -131,20 +131,23 @@ sbatch --export=ALL,LAMBDA_CLDICE=0.3 scripts/submit_train.sh
 
 The predict job is automatically queued as a dependent SLURM job after training completes.
 
-### Predict
+### Predict (training data — test/trainval split-aware)
 
+Automatically queued after training. To run manually:
 ```bash
-sbatch scripts/submit_predict.sh
+sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth scripts/submit_predict.sh
 ```
 
-Or manually:
+### Inference (new images without ground-truth masks)
+
+Place images in `inference_data/<folder_name>/` on the cluster, then:
 ```bash
-python src/predict.py \
-    --config     configs/config.yaml \
-    --input_dir  data/images \
-    --output_dir data/masks \
-    --ckpt_path  checkpoints/<job_id>/best_model.pth
+sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data/<folder_name>,OUT_DIR=predictions/inference/<folder_name>,INFERENCE_MODE=1 scripts/submit_predict.sh
 ```
+
+- Processes **all** `.tif` files recursively — no split filtering
+- Output masks mirror the input subfolder structure: `<name>_mask.tif`
+- Existing masks are overwritten (prints a notice before overwriting)
 
 ### Monitor
 
@@ -164,15 +167,16 @@ vessel_seg/
 │   ├── dataset.py         VesselDataset — tiling, sharpness, gradient magnitude, augmentation
 │   ├── loss.py            VesselLoss — Tversky + clDice + skel_density (Hanning-gated)
 │   ├── train.py           K-fold CV, AMP, W&B logging, early stopping
-│   ├── predict.py         tile → forward → stitch → W&B media log
+│   ├── predict.py         tile → forward → stitch → W&B media log; --inference_mode for new data
 │   └── summarize_cv.py    print_cv_summary — publication-ready CV table
 ├── configs/
 │   └── config.yaml        single experiment config (all hyperparameters)
 ├── scripts/
 │   ├── setup_env.sh       one-time conda env setup on Explorer
 │   ├── submit_train.sh    SLURM train job (auto-queues predict on success)
-│   ├── submit_predict.sh  SLURM predict job
+│   ├── submit_predict.sh  SLURM predict job; handles inference via INFERENCE_MODE=1
 │   └── visualize_d7_interactive.ipynb  interactive overlay viewer
+├── inference_data/        new images for inference — cluster only, git-ignored
 ├── vessel-seg-report/     LaTeX report source + compiled PDF
 ├── weights/               cached ResNet34 pretrained weights (git-ignored)
 ├── checkpoints/           saved model weights per job ID (git-ignored)
