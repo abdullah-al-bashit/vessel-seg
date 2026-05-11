@@ -39,6 +39,10 @@ export PYTHONUNBUFFERED=1
 
 cd /home/$USER/vessel_seg
 
+# ── Clear wandb cache to prevent disk quota issues ────────────────────────────
+rm -rf /home/$USER/.cache/wandb/
+echo "Cleared ~/.cache/wandb/"
+
 # ── Verify GPU + CUDA ──────────────────────────────────────────────────────────
 echo "Job ID:    $SLURM_JOB_ID"
 echo "Node:      $SLURMD_NODENAME"
