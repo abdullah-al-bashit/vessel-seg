@@ -4,7 +4,7 @@
 #SBATCH --error=logs/predict_%j.err
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=02:00:00
+#SBATCH --time=05:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --mail-type=END,FAIL
@@ -62,6 +62,7 @@ $PYTHON src/predict.py \
     --input_dir  $INPUT_DIR  \
     --mask_dir   $MASK_DIR   \
     --ckpt_path  $CKPT_PATH  \
-    --out_dir    $OUT_DIR
+    --out_dir    $OUT_DIR    \
+    ${INFERENCE_MODE:+--inference_mode}
 
 echo "Done: $(date)"

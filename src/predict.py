@@ -76,54 +76,70 @@ def main(args):
     model.load_state_dict(ckpt['model_state_dict'] if isinstance(ckpt, dict) else ckpt)
     model.eval()
 
-    # ** with recursive=True descends into subdirectories (D7/, D14/, D21/),
-    # matching how train.py's load_pairs finds images.
+    # Recursively find all .tif files under input_dir (walks into subdirectories)
     img_paths = sorted(glob.glob(os.path.join(args.input_dir, '**', '*.tif'), recursive=True))
 
-    # Load split labels written by train.py so each predicted image is labelled
-    # "test" or "trainval" in the W&B Media panel.
-    splits_path = os.path.join(os.path.dirname(args.ckpt_path), "data_splits.json")
-    splits_info = json.load(open(splits_path)) if os.path.exists(splits_path) else {}
+    # ── Inference mode: run on ALL images, skip split-based filtering ──────────
+    # Use --inference_mode when predicting on new data outside the training set.
+    # In normal predict mode only a subset of test/trainval images are run.
+    if args.inference_mode:
+        splits_info = {}    # no split labels — these images are not from training
+        img_to_mask = {}    # no ground-truth masks available for new data
+        job_type    = "inference"
+        print(f'Inference mode: {len(img_paths)} images found in {args.input_dir}')
+    else:
+        # Load split labels written by train.py so each predicted image is labelled
+        # "test" or "trainval" in the W&B Media panel.
+        splits_path = os.path.join(os.path.dirname(args.ckpt_path), "data_splits.json")
+        splits_info = json.load(open(splits_path)) if os.path.exists(splits_path) else {}
 
-    # Filter to NUM_TRAINVAL_SAMPLES random train-val + NUM_TEST_SAMPLES test images
-    if splits_info:
-        trainval_paths = [p for p in img_paths if os.path.basename(p) in splits_info and splits_info[os.path.basename(p)] == "trainval"]
-        test_paths = [p for p in img_paths if os.path.basename(p) in splits_info and splits_info[os.path.basename(p)] == "test"]
+        if splits_info:
+            trainval_paths = [p for p in img_paths if os.path.basename(p) in splits_info and splits_info[os.path.basename(p)] == "trainval"]
+            test_paths     = [p for p in img_paths if os.path.basename(p) in splits_info and splits_info[os.path.basename(p)] == "test"]
+            random.seed(seed)
+            selected_trainval = random.sample(trainval_paths, min(NUM_TRAINVAL_SAMPLES, len(trainval_paths)))
+            selected_test     = test_paths[:NUM_TEST_SAMPLES]
+            img_paths = sorted(selected_trainval + selected_test)
+            print(f'Filtered to: {len(selected_trainval)} train-val + {len(selected_test)} test images = {len(img_paths)} total')
 
-        random.seed(seed)
-        selected_trainval = random.sample(trainval_paths, min(NUM_TRAINVAL_SAMPLES, len(trainval_paths)))
-        selected_test = test_paths[:NUM_TEST_SAMPLES]
+        # Build {img_path → mask_path} lookup so we can compare predictions to ground truth.
+        img_to_mask = dict(load_pairs(args.input_dir, args.mask_dir)) if args.mask_dir else {}
+        job_type    = "predict"
 
-        img_paths = sorted(selected_trainval + selected_test)
-        print(f'Filtered to: {len(selected_trainval)} train-val + {len(selected_test)} test images = {len(img_paths)} total')
-
-    # Build {img_path → mask_path} lookup so we can compare predictions to ground truth.
-    # load_pairs matches by leading integer ID, so it works even if filenames differ
-    # (e.g. 17_..._Crop.tif paired with 17_..._Crop_Process_Binary.tif).
-    img_to_mask = dict(load_pairs(args.input_dir, args.mask_dir)) if args.mask_dir else {}
-
-    # log which checkpoint and which images are being predicted — links this
-    # prediction run back to the exact training run that produced the checkpoint
+    # Log which checkpoint and which images are being predicted
     wandb.init(
         entity   = "eeebashit",
         project  = "vessel-seg",
-        job_type = "predict",            # shown as a separate job type in the W&B dashboard
+        job_type = job_type,
         config   = {
-            "ckpt_path":   args.ckpt_path,
-            "input_dir":   args.input_dir,
-            "out_dir":     args.out_dir,
-            "n_images":    len(img_paths),
-            "input_files": img_paths,    # exact list of images being predicted
+            "ckpt_path":      args.ckpt_path,
+            "input_dir":      args.input_dir,
+            "out_dir":        args.out_dir,
+            "n_images":       len(img_paths),
+            "input_files":    img_paths,
+            "inference_mode": args.inference_mode,
         }
     )
     print(f'Using checkpoint: {args.ckpt_path}')
     print(f'Images to predict: {len(img_paths)}')
 
+    # Create top-level output directory if it does not yet exist
     os.makedirs(args.out_dir, exist_ok=True)
 
     for img_path in tqdm(img_paths, desc='images'):
-        fname    = os.path.basename(img_path).replace('.tif', '_pred.tif')
-        out_path = os.path.join(args.out_dir, fname)
+        if args.inference_mode:
+            # Mirror the subfolder structure from input_dir into out_dir.
+            # e.g. inference_data/batch1/img.tif → predictions/inference/batch1/img_mask.tif
+            rel      = os.path.relpath(img_path, args.input_dir)  # path relative to input root
+            out_path = os.path.join(args.out_dir, rel.replace('.tif', '_mask.tif'))
+            os.makedirs(os.path.dirname(out_path), exist_ok=True) # create subfolder if needed
+        else:
+            fname    = os.path.basename(img_path).replace('.tif', '_pred.tif')
+            out_path = os.path.join(args.out_dir, fname)
+
+        # Warn before overwriting an existing prediction (e.g. re-running with a new model)
+        if os.path.exists(out_path):
+            print(f'  [overwrite] {out_path}')
 
         mask, img_tile = predict_image(model, img_path, device)
         imwrite(out_path, (mask.astype(np.uint8) * 255))
@@ -228,8 +244,11 @@ if __name__ == '__main__':
     parser.add_argument('--input_dir',  required=True)
     parser.add_argument('--ckpt_path',  required=True)
     parser.add_argument('--out_dir',    default='../predictions')
-    parser.add_argument('--mask_dir',   default=None,
+    parser.add_argument('--mask_dir',       default=None,
                         help='Optional ground-truth mask folder. If given, log a per-image '
                              'TP/FP/FN error map alongside the prediction.')
+    parser.add_argument('--inference_mode', action='store_true', default=False,
+                        help='Run on ALL images in input_dir with no split filtering. '
+                             'Output masks mirror the input subfolder structure.')
     args = parser.parse_args()
     main(args)

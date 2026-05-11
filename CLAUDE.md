@@ -21,7 +21,7 @@ Each run copies its YAML into `checkpoints/<job_id>/config.yaml` for self-docume
 - **Project path**: `/home/a.bashit/vessel_seg/`
 - **Sync command**:
   ```bash
-  rsync -avz --exclude='data/' --exclude='checkpoints/' --exclude='predictions/' --exclude='weights/*.pth' --exclude='logs/' --exclude='wandb/' --exclude='__pycache__/' --delete \
+  rsync -avz --exclude='data/' --exclude='checkpoints/' --exclude='predictions/' --exclude='weights/*.pth' --exclude='logs/' --exclude='wandb/' --exclude='__pycache__/' --exclude='inference_data/' --delete \
       /Users/bashit.a/Downloads/vessel_seg_github/ a.bashit@login.explorer.northeastern.edu:/home/a.bashit/vessel_seg/
   ```
 - **Submit training job**:

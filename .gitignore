@@ -35,6 +35,9 @@ checkpoints/
 # Predictions output
 predictions/
 
+# Inference input data — lives only on the cluster, not tracked in git
+inference_data/
+
 # Logs
 logs/
 *.out
