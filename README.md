@@ -35,7 +35,7 @@ Dilated refinement head (dilation=2 → 9×9 receptive field)
 Conv 1×1 → logits (B, 1, H, W)
         │
         ▼
-Loss: Tversky (β=0.7 penalises missed vessels) + optional clDice + skel_density
+Loss: Tversky (β=0.5 default, configurable) + optional clDice + skel_density
         │
         ▼
 Binary mask (H × W)
@@ -51,7 +51,7 @@ Binary mask (H × W)
 | Trainable ResNet34 encoder | Adapts to fluorescence domain; ImageNet weights as starting point |
 | AttentionGate on all 4 skip connections | Suppresses irrelevant background features at every decoder scale |
 | Dilated refinement head (d=2) | 9×9 effective receptive field fills vessel gaps before final projection |
-| Tversky loss (α=0.3, β=0.7) | Penalises missed vessels 2.3× more than false positives |
+| Tversky loss (β configurable) | β=0.5 → Dice; β=0.7 → penalises missed vessels 2.3× more than FP |
 | Hanning loss gate | Tile-boundary pixels never contribute to loss — prevents broken-vessel learning |
 | Horizontal tiling + overlap stitching | No vertical vessel cuts on panoramic ~15800×1300 px images |
 | Per-image min-max normalization | Handles any bit depth or acquisition settings |
@@ -119,11 +119,14 @@ sbatch scripts/submit_train.sh
 
 Override config values via environment variables:
 ```bash
-# Quick 1-epoch timing test
-sbatch --export=ALL,EPOCHS=1,FOLDS=1 scripts/submit_train.sh
+# Quick 1-fold timing test
+sbatch --export=ALL,EPOCHS=5,FOLDS=1 scripts/submit_train.sh
 
-# Larger batch + more workers
-sbatch --export=ALL,BATCH_SIZE=16,NUM_WORKERS=8 scripts/submit_train.sh
+# Disable W&B (skips ~7 min startup overhead)
+sbatch --export=ALL,USE_WANDB=0 scripts/submit_train.sh
+
+# Warmstart from a prior checkpoint
+sbatch --export=ALL,WARMSTART_CKPT=checkpoints/<job_id>/best_model.pth scripts/submit_train.sh
 
 # Enable clDice loss
 sbatch --export=ALL,LAMBDA_CLDICE=0.3 scripts/submit_train.sh
@@ -140,14 +143,15 @@ sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth scripts/submit
 
 ### Inference (new images without ground-truth masks)
 
-Place images in `inference_data/<folder_name>/` on the cluster, then:
+Place images in `inference_data/` on the cluster, then:
 ```bash
-sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data/<folder_name>,OUT_DIR=predictions/inference/<folder_name>,INFERENCE_MODE=1 scripts/submit_predict.sh
+sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR=,USE_WANDB=0 scripts/submit_predict.sh
 ```
 
 - Processes **all** `.tif` files recursively — no split filtering
 - Output masks mirror the input subfolder structure: `<name>_mask.tif`
-- Existing masks are overwritten (prints a notice before overwriting)
+- `INFERENCE_MODE=1` is set automatically when `INPUT_DIR` is not `data/images`
+- `USE_WANDB=0` recommended for inference — saves ~7 min startup time
 
 ### Monitor
 
@@ -191,8 +195,8 @@ vessel_seg/
 ## W&B Logging
 
 - **Entity**: `eeebashit` · **Project**: `vessel-seg`
-- Per-epoch: `fold{N}/train_{loss,tversky,cldice,boundary}` and validation metrics
-- Every 10 val epochs: attention maps (heatmap, overlay, alpha) for all 3 gates (att1, att2, att3)
+- Per-epoch: `fold{N}/train_{loss,dice,tversky,cldice}` and matching `val_*` metrics
+- Attention maps (heatmap, overlay, alpha) for all 3 gates logged every 10 val epochs
 - Predict run: originals, prediction overlay, ground truth, TP/FP/FN panels, attention maps
 
 ---
@@ -203,7 +207,6 @@ vessel_seg/
 |---|---|
 | Dice coefficient | Pixel-level overlap |
 | clDice | Centerline topology — vessel connectivity |
-| Hausdorff (95%) | Worst-case boundary error |
 
 ---
 
@@ -213,4 +216,6 @@ Predicted masks saved as uint8 TIFF:
 - `255` = vessel lumen
 - `0` = background / vessel walls
 
-Filename format: `{original_name}_pred.tif`
+Filename format:
+- Training data predict: `{original_name}_pred.tif`
+- Inference mode: `{original_name}_mask.tif` (subfolder structure mirrored)
