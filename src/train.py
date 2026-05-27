@@ -93,7 +93,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, train=True,
               epoch=None, fold=None):
     model.train(train)
     total_loss  = 0.0
-    total_parts = {'tversky': 0.0, 'cldice': 0.0, 'skel_density': 0.0}
+    total_parts = {'tversky': 0.0, 'cldice': 0.0}
     dice_num    = 0.0
     dice_den    = 0.0
 
@@ -244,7 +244,6 @@ def main(args):
         model = create_model(device, ckpt_path=args.warmstart_ckpt or None)
         criterion = VesselLoss(lambda_tversky=args.lambda_tversky,
                                lambda_cldice=args.lambda_cldice,
-                               lambda_skel_density=args.lambda_skel_density,
                                tversky_beta=args.tversky_beta)
         scaler    = GradScaler() if device.type == 'cuda' else None
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -270,23 +269,21 @@ def main(args):
 
             print(f'Epoch {epoch:3d} | '
                   f'train {tr_loss:.4f} dice={tr_dice:.4f} '
-                  f'(tv={tr_parts["tversky"]:.3f} cl={tr_parts["cldice"]:.3f} sd={tr_parts["skel_density"]:.3f}) | '
+                  f'(tv={tr_parts["tversky"]:.3f} cl={tr_parts["cldice"]:.3f}) | '
                   f'val {va_loss:.4f} dice={va_dice:.4f} '
-                  f'(tv={va_parts["tversky"]:.3f} cl={va_parts["cldice"]:.3f} sd={va_parts["skel_density"]:.3f}) | '
+                  f'(tv={va_parts["tversky"]:.3f} cl={va_parts["cldice"]:.3f}) | '
                   f'{t_epoch:.1f}s (train {t1-t0:.1f}s)')
 
             wandb.log({
-                f"fold{fold+1}/epoch":              epoch,
-                f"fold{fold+1}/train_loss":         tr_loss,
-                f"fold{fold+1}/train_dice":         tr_dice,
-                f"fold{fold+1}/train_tversky":      tr_parts["tversky"],
-                f"fold{fold+1}/train_cldice":       tr_parts["cldice"],
-                f"fold{fold+1}/train_skel_density": tr_parts["skel_density"],
-                f"fold{fold+1}/val_loss":           va_loss,
-                f"fold{fold+1}/val_dice":           va_dice,
-                f"fold{fold+1}/val_tversky":        va_parts["tversky"],
-                f"fold{fold+1}/val_cldice":         va_parts["cldice"],
-                f"fold{fold+1}/val_skel_density":   va_parts["skel_density"],
+                f"fold{fold+1}/epoch":         epoch,
+                f"fold{fold+1}/train_loss":    tr_loss,
+                f"fold{fold+1}/train_dice":    tr_dice,
+                f"fold{fold+1}/train_tversky": tr_parts["tversky"],
+                f"fold{fold+1}/train_cldice":  tr_parts["cldice"],
+                f"fold{fold+1}/val_loss":      va_loss,
+                f"fold{fold+1}/val_dice":      va_dice,
+                f"fold{fold+1}/val_tversky":   va_parts["tversky"],
+                f"fold{fold+1}/val_cldice":    va_parts["cldice"],
             })
 
             if va_loss < best_loss:
@@ -335,13 +332,12 @@ def main(args):
     model = create_model(device, ckpt_path=os.path.join(args.ckpt_dir, 'best_model.pth'))
     criterion = VesselLoss(lambda_tversky=args.lambda_tversky,
                            lambda_cldice=args.lambda_cldice,
-                           lambda_skel_density=args.lambda_skel_density,
                            tversky_beta=args.tversky_beta)
 
     te_loss, te_parts, te_dice = run_epoch(model, test_loader, criterion,
                                            None, None, device, train=False)
     print(f'Test loss {te_loss:.4f} dice={te_dice:.4f} '
-          f'(tv={te_parts["tversky"]:.3f} cl={te_parts["cldice"]:.3f} sd={te_parts["skel_density"]:.3f})')
+          f'(tv={te_parts["tversky"]:.3f} cl={te_parts["cldice"]:.3f})')
 
     print('\nStitched-image Dice on test set:')
     dice_per_image = []
@@ -362,7 +358,6 @@ def main(args):
         "test/dice":          te_dice,
         "test/tversky":       te_parts["tversky"],
         "test/cldice":        te_parts["cldice"],
-        "test/skel_density":  te_parts["skel_density"],
         "test/dice_stitched": mean_dice,
         "best_fold":          best_fold,
         "cv_mean_val_loss":   float(np.mean(best_loss_folds)),
@@ -425,8 +420,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmstart_ckpt',  default=None,
                         help='Checkpoint to warmstart all folds from (e.g. best_model.pth from a prior run).')
     parser.add_argument('--lambda_tversky',      type=float, default=1.0)
-    parser.add_argument('--lambda_cldice',       type=float, default=0.0)   # disabled; enable for topology
-    parser.add_argument('--lambda_skel_density', type=float, default=0.0)   # disabled; enable for blob penalty
+    parser.add_argument('--lambda_cldice',  type=float, default=0.0)   # disabled; enable for topology
     parser.add_argument('--tversky_beta',        type=float, default=0.5,
                         help='FN weight β; α=1−β derived. 0.5=Dice, >0.5 penalises FN more.')
     # ── Dataset / augmentation ────────────────────────────────────────────────

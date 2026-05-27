@@ -99,10 +99,9 @@ batch_size: 12
 lr:         0.0001
 patience:   30
 
-lambda_tversky:      1.0
-lambda_cldice:       0.0   # enable for topology-aware training
-lambda_skel_density: 0.0   # enable for blob-penalty training
-tversky_beta:        0.5   # 0.5 = Dice; 0.7 = FN penalised 2.3× more
+lambda_tversky: 1.0
+lambda_cldice:  0.0   # enable for topology-aware training
+tversky_beta:   0.5   # 0.5 = Dice; 0.7 = FN penalises missed vessels more
 ```
 
 Each run copies its config into `checkpoints/<SLURM_JOB_ID>/config.yaml`.

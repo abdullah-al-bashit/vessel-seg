@@ -20,10 +20,9 @@ lr:          0.0001
 num_workers: 8
 
 # ── Loss weights (VesselLoss) ─────────────────────────────────────────────────
-lambda_tversky:       1.0
-lambda_cldice:        0.0   # disabled — enable for topology-aware training
-lambda_skel_density:  0.0   # disabled — enable for blob-penalty training
-tversky_beta:         0.5   # 0.5 = Dice; 0.7 = FN penalised 2.3× more than FP
+lambda_tversky: 1.0
+lambda_cldice:  0.0   # disabled — enable for topology-aware training
+tversky_beta:   0.5   # 0.5 = Dice; 0.7 = FN penalised 2.3× more than FP
 
 # ── Hanning gate ──────────────────────────────────────────────────────────────
 plain_hann: false

@@ -52,7 +52,7 @@ Each run copies its YAML into `checkpoints/<job_id>/config.yaml` for self-docume
 | `src/model.py` | `AttentionUNet` + `AttentionGate` + `visualize_attention_maps` |
 
 | `src/dataset.py` | `VesselDataset` — tiling, sharpness, gradient magnitude, augmentation |
-| `src/loss.py` | `VesselLoss` — Tversky + clDice (λ=0) + skeleton density (λ=0); all independently weighted |
+| `src/loss.py` | `VesselLoss` — Tversky + clDice (λ=0); independently weighted |
 | `src/predict.py` | Full-image inference: tile → forward → stitch → W&B media log; `--inference_mode` predicts all images and mirrors subfolder structure |
 | `src/summarize_cv.py` | `print_cv_summary()` — publication-ready CV table, called directly from train.py |
 | `configs/config.yaml` | Single experiment config (AttentionUNet, 5-fold CV, 100 epochs, patience 30) |
@@ -61,7 +61,7 @@ Each run copies its YAML into `checkpoints/<job_id>/config.yaml` for self-docume
 
 ## W&B
 - Entity: `eeebashit`, Project: `vessel-seg`
-- Per-epoch metrics: `fold{N}/train_{loss,dice,tversky,cldice,skel_density}`, `fold{N}/val_{loss,dice,...}`
-- Test metrics: `test/{loss,dice,tversky,cldice,skel_density,dice_stitched}`
+- Per-epoch metrics: `fold{N}/train_{loss,dice,tversky,cldice}`, `fold{N}/val_{loss,dice,tversky,cldice}`
+- Test metrics: `test/{loss,dice,tversky,cldice,dice_stitched}`
 - Predict run: originals, ch_grad, ch_sharp, prediction overlay, gt, tp/fp/fn, combined, attention maps
 - Disable with `USE_WANDB=0` in sbatch `--export` — saves ~7 min startup time per job

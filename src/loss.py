@@ -109,57 +109,30 @@ def cldice_loss(pred_prob, target, weight=None, iters=5, eps=1e-6):
     return 1.0 - 2.0 * (t_prec * t_sens) / (t_prec + t_sens + eps)  # scalar
 
 
-# ── Skeleton Density Loss ──────────────────────────────────────────────────────
-
-def skeleton_density_loss(pred_prob, target, weight=None, iters=5, eps=1e-6):
-    """
-    FN skeleton density: penalises blob-shaped missed vessel branches.
-
-    Operates on the FN region (1−pred)×target (pixels the model misses).
-      thin missed vessel  → thin FN  → high density → loss≈0
-      large missed branch → blob FN  → low density  → loss≈1
-
-    Per-image density then mean: each image contributes equally regardless of FN area.
-    Empty FN (no misses): fn_sum≈0 → density=eps/eps=1 → loss=0.
-    """
-    pred_f32   = pred_prob.float()
-    target_f32 = target.float()
-    w          = weight.float() if weight is not None else 1.0
-
-    fn_pred  = (1.0 - pred_f32) * target_f32                  # (B, 1, H, W)
-    skel_fn  = soft_skeletonize(fn_pred, iters=iters)          # (B, 1, H, W)
-    skel_sum = (skel_fn * w).sum(dim=(1, 2, 3))                # (B,)
-    fn_sum   = (fn_pred * w).sum(dim=(1, 2, 3))                # (B,)
-    return (1.0 - (skel_sum + eps) / (fn_sum + eps)).mean()    # scalar
-
-
 # ── Combined Gated Loss ────────────────────────────────────────────────────────
 
 class VesselLoss(nn.Module):
     """
-    L = λ_tv·Tversky(pred, gt, W) + λ_cl·clDice(pred, gt, W) + λ_sd·SkelDensity(pred, gt, W)
+    L = λ_tv·Tversky(pred, gt, W) + λ_cl·clDice(pred, gt, W)
 
-    All three terms are independently weighted; set any λ to 0 to disable.
-    Current defaults: only Tversky active (λ_cl=0, λ_sd=0).
+    Both terms are independently weighted; set any λ to 0 to disable.
+    Current defaults: only Tversky active (λ_cl=0).
 
     Tversky: TP / (TP + α·FP + β·FN),  α = 1 − β
       β=0.5  → standard Dice
       β>0.5  → penalises missed vessels more than false alarms
 
     Hyperparameters:
-      lambda_tversky      default 1.0
-      lambda_cldice       default 0.0  (disabled — enable for topology training)
-      lambda_skel_density default 0.0  (disabled — enable for blob-penalty training)
-      tversky_beta        default 0.5
+      lambda_tversky  default 1.0
+      lambda_cldice   default 0.0  (disabled — enable for topology training)
+      tversky_beta    default 0.5
     """
-    def __init__(self, lambda_tversky=1.0, lambda_cldice=0.0,
-                 lambda_skel_density=0.0, tversky_beta=0.5):
+    def __init__(self, lambda_tversky=1.0, lambda_cldice=0.0, tversky_beta=0.5):
         super().__init__()
-        self.lam_tversky     = lambda_tversky
-        self.lam_cldice      = lambda_cldice
-        self.lam_skel_density = lambda_skel_density
-        self.tversky_beta    = tversky_beta
-        self.tversky_alpha   = 1.0 - tversky_beta
+        self.lam_tversky   = lambda_tversky
+        self.lam_cldice    = lambda_cldice
+        self.tversky_beta  = tversky_beta
+        self.tversky_alpha = 1.0 - tversky_beta
 
     def forward(self, logits, target, hann_weight):
         """
@@ -176,8 +149,5 @@ class VesselLoss(nn.Module):
         l_cl = (cldice_loss(pred, target, hann_weight)
                 if self.lam_cldice > 0 else pred.new_zeros(1))
 
-        l_sd = (skeleton_density_loss(pred, target, hann_weight)
-                if self.lam_skel_density > 0 else pred.new_zeros(1))
-
-        total = self.lam_tversky * l_tv + self.lam_cldice * l_cl + self.lam_skel_density * l_sd
-        return total, {'tversky': l_tv.item(), 'cldice': l_cl.item(), 'skel_density': l_sd.item()}, pred
+        total = self.lam_tversky * l_tv + self.lam_cldice * l_cl
+        return total, {'tversky': l_tv.item(), 'cldice': l_cl.item()}, pred

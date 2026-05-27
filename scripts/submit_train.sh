@@ -76,7 +76,7 @@ echo "CKPT_DIR:  $CKPT_DIR"
 # Environment vars override config values — useful for quick tests and GPU optimization:
 #   sbatch --export=ALL,EPOCHS=1 scripts/submit_train.sh
 #   sbatch --export=ALL,BATCH_SIZE=96,NUM_WORKERS=32 scripts/submit_train.sh
-#   sbatch --export=ALL,EPOCHS=20,FOLDS=1,LAMBDA_SKEL_DENSITY=0.5 scripts/submit_train.sh
+#   sbatch --export=ALL,EPOCHS=20,FOLDS=1 scripts/submit_train.sh
 $PYTHON src/train.py \
     --config     $CONFIG    \
     --input_dir  $INPUT_DIR \
@@ -88,7 +88,6 @@ $PYTHON src/train.py \
     ${NUM_WORKERS:+--num_workers $NUM_WORKERS} \
     ${WARMSTART_CKPT:+--warmstart_ckpt $WARMSTART_CKPT} \
     ${LAMBDA_TVERSKY:+--lambda_tversky $LAMBDA_TVERSKY} \
-    ${LAMBDA_SKEL_DENSITY:+--lambda_skel_density $LAMBDA_SKEL_DENSITY} \
     ${LAMBDA_CLDICE:+--lambda_cldice $LAMBDA_CLDICE} \
     ${TVERSKY_BETA:+--tversky_beta $TVERSKY_BETA} \
 
