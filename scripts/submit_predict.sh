@@ -60,7 +60,11 @@ echo "Start:     $(date)"
 # data_splits.json (next to CKPT_PATH) tags each W&B Media caption as [test] or [trainval].
 # Defaults are used when running normally after training.
 # Override via --export to point at a different folder, e.g. for inference on new data:
-#   sbatch --export=ALL,CKPT_PATH=...,INPUT_DIR=inference_data/batch1,OUT_DIR=predictions/inference/batch1,INFERENCE_MODE=1 scripts/submit_predict.sh
+#   sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR= scripts/submit_predict.sh
+#
+# Output naming convention (both land in predictions/ by default):
+#   Training predict : predictions/<name>_pred.tif   — shows it came from train/val data
+#   Inference        : predictions/<name>_mask.tif   — shows it came from new inference data
 INPUT_DIR="${INPUT_DIR:-data/images}"
 MASK_DIR="${MASK_DIR:-data/masks}"     # for TP/FP/FN error overlay; omit to skip
 # CKPT_PATH is set by submit_train.sh via --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth

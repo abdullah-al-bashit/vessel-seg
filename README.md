@@ -165,7 +165,8 @@ sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=infe
 
 - Processes **all** `.tif` files recursively — no split filtering
 - `INFERENCE_MODE=1` is set automatically when `INPUT_DIR` is not `data/images`
-- Output masks mirror the input subfolder structure: `predictions/inference/<subfolder>/<name>_mask.tif`
+- Output masks saved to `predictions/` as `<name>_mask.tif` (the `_mask.tif` suffix distinguishes them from training-predict outputs which use `_pred.tif`)
+- Subfolder structure inside `inference_data/` is mirrored: `inference_data/batch1/img.tif` → `predictions/batch1/img_mask.tif`
 - W&B run logs originals, gradient/sharpness channels, prediction overlays, and attention maps
 - When `MASK_DIR` is provided, a `dice_per_image` table and `mean_dice` scalar are also logged
 
