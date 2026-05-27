@@ -11,7 +11,7 @@ seed: 42
 n_folds:    5
 test_split: 0.2
 folds:      5
-patience:   30
+patience:   20
 
 # ── Training ──────────────────────────────────────────────────────────────────
 epochs:      100

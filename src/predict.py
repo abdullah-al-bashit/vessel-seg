@@ -127,7 +127,8 @@ def main(args):
     # Create top-level output directory if it does not yet exist
     os.makedirs(args.out_dir, exist_ok=True)
 
-    times = []   # per-image wall-clock seconds, used for summary at the end
+    times      = []   # per-image wall-clock seconds, used for summary at the end
+    dice_rows  = []   # (filename, dice) — collected for end-of-run W&B Table
 
     for img_path in tqdm(img_paths, desc='images'):
         t0 = time.time()
@@ -215,18 +216,25 @@ def main(args):
                                       caption=f"{cap}  |  prediction"),
         }
 
-        # If GT mask exists, log isolated TP/FP/FN panels
+        # If GT mask exists, compute Dice and log isolated TP/FP/FN panels
         gt_path = img_to_mask.get(img_path)
         if gt_path:
-            gt = imread(gt_path) > 0                          # (H, W) bool ground truth
+            gt  = imread(gt_path) > 0                         # (H, W) bool ground truth
+            tp  = mask  &  gt
+            fp  = mask  & ~gt
+            fn  = ~mask &  gt
+            dice = (2.0 * float(tp.sum())) / (float(mask.sum() + gt.sum()) + 1e-8)
+            dice_rows.append((fname, dice))
+            print(f'  Dice: {dice:.4f}')
             log_payload.update({
+                "dice":     dice,
                 "gt":       wandb.Image(overlay(img_rgb, gt, GREEN),
                                         caption=f"{cap}  |  green = ground-truth vessel"),
-                "tp":       wandb.Image(overlay(img_rgb, mask  &  gt, GREEN),
+                "tp":       wandb.Image(overlay(img_rgb, tp, GREEN),
                                         caption=f"{cap}  |  TP"),
-                "fp":       wandb.Image(overlay(img_rgb, mask  & ~gt, RED),
+                "fp":       wandb.Image(overlay(img_rgb, fp, RED),
                                         caption=f"{cap}  |  FP"),
-                "fn":       wandb.Image(overlay(img_rgb, ~mask &  gt, YELLOW),
+                "fn":       wandb.Image(overlay(img_rgb, fn, YELLOW),
                                         caption=f"{cap}  |  FN"),
                 "combined": wandb.Image(make_combined(mask, gt),
                                         caption=f"{cap}  |  green=TP  red=FP  yellow=FN"),
@@ -248,6 +256,17 @@ def main(args):
         print(f'  min:           {min(times):.1f}s')
         print(f'  max:           {max(times):.1f}s')
         print(f'  total:         {sum(times):.1f}s')
+
+    if dice_rows:
+        dice_vals = [d for _, d in dice_rows]
+        print(f'\nDice summary — {len(dice_rows)} images:')
+        print(f'  mean: {sum(dice_vals)/len(dice_vals):.4f}')
+        print(f'  min:  {min(dice_vals):.4f}  ({dice_rows[dice_vals.index(min(dice_vals))][0]})')
+        print(f'  max:  {max(dice_vals):.4f}  ({dice_rows[dice_vals.index(max(dice_vals))][0]})')
+        tbl = wandb.Table(columns=["image", "dice"])
+        for name, d in sorted(dice_rows, key=lambda x: x[1], reverse=True):
+            tbl.add_data(name, round(d, 4))
+        wandb.log({"dice_per_image": tbl, "mean_dice": sum(dice_vals) / len(dice_vals)})
 
     wandb.finish()   # marks predict run complete in the dashboard
 

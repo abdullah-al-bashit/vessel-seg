@@ -35,7 +35,7 @@ Dilated refinement head (dilation=2 → 9×9 receptive field)
 Conv 1×1 → logits (B, 1, H, W)
         │
         ▼
-Loss: Tversky (β=0.5 default, configurable) + optional clDice + skel_density
+Loss: Tversky (β=0.5 default, configurable) + optional clDice
         │
         ▼
 Binary mask (H × W)
@@ -110,53 +110,73 @@ Each run copies its config into `checkpoints/<SLURM_JOB_ID>/config.yaml`.
 
 ## Usage
 
-### Train (K-fold cross-validation)
+### 1 — Train (K-fold cross-validation)
 
 ```bash
 sbatch scripts/submit_train.sh
 ```
 
-Override config values via environment variables:
+A predict job is **automatically queued** as a dependent SLURM job and runs on completion.
+
+Common overrides:
 ```bash
-# Quick 1-fold timing test
+# 1-fold timing test (5 epochs)
 sbatch --export=ALL,EPOCHS=5,FOLDS=1 scripts/submit_train.sh
 
 # Disable W&B (skips ~7 min startup overhead)
 sbatch --export=ALL,USE_WANDB=0 scripts/submit_train.sh
 
-# Warmstart from a prior checkpoint
+# Warmstart every fold from a prior checkpoint
 sbatch --export=ALL,WARMSTART_CKPT=checkpoints/<job_id>/best_model.pth scripts/submit_train.sh
 
-# Enable clDice loss
+# Enable clDice topology loss
 sbatch --export=ALL,LAMBDA_CLDICE=0.3 scripts/submit_train.sh
 ```
 
-The predict job is automatically queued as a dependent SLURM job after training completes.
+Checkpoints are saved per job: `checkpoints/<SLURM_JOB_ID>/best_model.pth`.  
+The config used is copied there too: `checkpoints/<SLURM_JOB_ID>/config.yaml`.
 
-### Predict (training data — test/trainval split-aware)
+---
 
-Automatically queued after training. To run manually:
+### 2 — Predict on training data (test/trainval split-aware)
+
+Automatically queued after training. To re-run manually against an existing checkpoint:
 ```bash
 sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth scripts/submit_predict.sh
 ```
 
-### Inference (new images without ground-truth masks)
+- Predicts a subset of images (2 trainval + up to 5 test) and logs them to W&B
+- TP/FP/FN overlays and per-image Dice are logged when ground-truth masks are present
+- Output masks saved as `predictions/<name>_pred.tif`
 
-Place images in `inference_data/` on the cluster, then:
+---
+
+### 3 — Inference on new images in `inference_data/`
+
+Place `.tif` images on the cluster under `inference_data/` (subfolders are fine), then:
+
 ```bash
-sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR=,USE_WANDB=0 scripts/submit_predict.sh
+# No ground-truth masks available
+sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR= scripts/submit_predict.sh
+
+# With ground-truth masks — logs per-image Dice + TP/FP/FN panels to W&B
+sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR=inference_masks scripts/submit_predict.sh
 ```
 
 - Processes **all** `.tif` files recursively — no split filtering
-- Output masks mirror the input subfolder structure: `<name>_mask.tif`
 - `INFERENCE_MODE=1` is set automatically when `INPUT_DIR` is not `data/images`
-- `USE_WANDB=0` recommended for inference — saves ~7 min startup time
+- Output masks mirror the input subfolder structure: `predictions/inference/<subfolder>/<name>_mask.tif`
+- W&B run logs originals, gradient/sharpness channels, prediction overlays, and attention maps
+- When `MASK_DIR` is provided, a `dice_per_image` table and `mean_dice` scalar are also logged
+
+---
 
 ### Monitor
 
 ```bash
 squeue -u $USER
 tail -f logs/train_<JOBID>.out
+tail -f logs/predict_<JOBID>.out
 ```
 
 ---
@@ -168,7 +188,7 @@ vessel_seg/
 ├── src/
 │   ├── model.py           AttentionUNet + AttentionGate + visualize_attention_maps
 │   ├── dataset.py         VesselDataset — tiling, sharpness, gradient magnitude, augmentation
-│   ├── loss.py            VesselLoss — Tversky + clDice + skel_density (Hanning-gated)
+│   ├── loss.py            VesselLoss — Tversky + clDice (Hanning-gated); independently weighted
 │   ├── train.py           K-fold CV, AMP, W&B logging, early stopping
 │   ├── predict.py         tile → forward → stitch → W&B media log; --inference_mode for new data
 │   └── summarize_cv.py    print_cv_summary — publication-ready CV table
@@ -194,9 +214,9 @@ vessel_seg/
 ## W&B Logging
 
 - **Entity**: `eeebashit` · **Project**: `vessel-seg`
-- Per-epoch: `fold{N}/train_{loss,dice,tversky,cldice}` and matching `val_*` metrics
-- Attention maps (heatmap, overlay, alpha) for all 3 gates logged every 10 val epochs
-- Predict run: originals, prediction overlay, ground truth, TP/FP/FN panels, attention maps
+- **Training** — per-epoch: `fold{N}/train_{loss,dice,tversky,cldice}` and matching `val_*`; attention maps every 10 val epochs
+- **Predict / Inference** — per image: originals, gradient, sharpness, prediction overlay, attention maps; when masks are available: ground truth, TP/FP/FN panels, `dice` scalar, and an end-of-run `dice_per_image` table + `mean_dice`
+- Disable with `USE_WANDB=0` in `--export` — saves ~7 min startup time per job
 
 ---
 

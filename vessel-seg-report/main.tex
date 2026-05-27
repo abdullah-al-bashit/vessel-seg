@@ -58,26 +58,8 @@ The full images were processed as full-height horizontal strips. Each tile was 1
 The model was an Attention U-Net with a trainable pretrained ResNet34 encoder. Decoder skip connections were gated before fusion, allowing the model to suppress irrelevant encoder features while preserving vessel-like structures. A lightweight dilated refinement head produced the final logit map, which was converted to vessel probability by a sigmoid function.
 \begin{figure}[htbp]
 \centering
-\resizebox{0.98\linewidth}{!}{%
-\begin{tikzpicture}[font=\small, box/.style={draw, rounded corners=2pt, minimum width=2.6cm, minimum height=1.05cm, align=center, fill=#1, blur shadow={shadow blur steps=5}}, arr/.style={-{Latex[length=3mm]}, thick}]
-\node[box=BlueGreen!18] (input) {3-channel input\\$I, G, S$};
-\node[box=SkyBlue!22, right=1.0cm of input] (enc1) {ResNet34\\encoder};
-\node[box=SkyBlue!30, right=0.8cm of enc1] (enc2) {deep feature\\pyramid};
-\node[box=Orange!22, right=1.0cm of enc2] (gate) {attention-gated\\skip features};
-\node[box=YellowOrange!22, right=0.9cm of gate] (dec) {U-Net\\decoder};
-\node[box=RedOrange!18, right=0.9cm of dec] (refine) {dilated\\refinement};
-\node[box=ForestGreen!18, right=0.9cm of refine] (out) {vessel\\probability};
-\draw[arr] (input) -- (enc1);
-\draw[arr] (enc1) -- (enc2);
-\draw[arr] (enc2) -- (gate);
-\draw[arr] (gate) -- (dec);
-\draw[arr] (dec) -- (refine);
-\draw[arr] (refine) -- (out);
-\draw[arr, dashed, MidnightBlue] (enc1.north) to[out=45,in=135] node[above, align=center] {skip features\\filtered by gates} (gate.north);
-\draw[arr, dashed, MidnightBlue] (enc2.south) to[out=-45,in=-135] node[below, align=center] {semantic context} (dec.south);
-\end{tikzpicture}%
-}
-\caption{Editable architecture schematic. The model receives intensity, gradient, and sharpness channels, processes them with a trainable pretrained ResNet34 encoder, filters skip features using attention gates, decodes vessel structure, refines the logits, and outputs a sigmoid vessel-probability map.}
+\includegraphics[width=\linewidth]{figures/model_arch.pdf}
+\caption{Attention U-Net architecture. A three-channel input (grayscale intensity $I$, gradient magnitude $G$, sharpness $S$) is encoded by a pretrained trainable ResNet34 backbone that produces five feature maps at progressively coarser spatial scales ($e_0$--$e_4$). Attention gates (Attn0--Attn3) filter each encoder skip connection using the corresponding decoder query before the skip is fused with the upsampled decoder state. A dilated refinement head ($d=2$, effective $9\times9$ receptive field) follows the last decoder stage and a $1\times1$ projection with sigmoid activation produces the final vessel-probability map.}
 \label{fig:architecture}
 \end{figure}
 
@@ -197,6 +179,20 @@ The loss was
 \mathcal{L}_{\mathrm{Tv}} = 1 - \frac{TP+\epsilon}{TP+\alpha FP+\beta FN+\epsilon},
 \end{equation}
 with the configured final run using $\beta=0.5$ and the Tversky term as the active segmentation loss. The model probability was $p_i=\sigma(z_i)$, where $z_i$ is the output logit.
+
+\paragraph{Hann boundary gate.}
+Because the wide panoramic images are divided into overlapping horizontal tiles during training, the model would otherwise see vessel structures that are artificially cut at tile edges. To prevent the network from learning these artefactual breaks as a signal, every per-pixel loss term is multiplied by a spatial gate $W(u,v)$.
+
+The gate is derived from a 1-D Hann window applied along the tile width axis:
+\begin{equation}
+  h(u) = \tfrac{1}{2}\!\left(1 - \cos\!\left(\frac{2\pi u}{T_w - 1}\right)\right), \qquad u = 0,\ldots,T_w-1,
+\end{equation}
+where $T_w$ is the tile width in pixels. By construction $h(0)=h(T_w-1)=0$ and $h(T_w/2)=1$, so tile-edge pixels are fully excluded from the loss and central pixels receive full weight. When the sharpness-modulated mode is active the gate is further scaled by the normalised sharpness channel $S(u,v)$:
+\begin{equation}
+  W(u,v) = h(u)\cdot S(u,v).
+\end{equation}
+This second factor additionally down-weights blurred or out-of-focus regions, concentrating the training signal on locally crisp structure near the centre of each tile. Tile-boundary pixels still participate in the forward pass and contribute to the prediction; they are excluded only from gradient computation, ensuring that the stitched output at inference is continuous across seam positions.
+
 \section{Training Protocol}
 Training ran on the Explorer HPC cluster as job 6670898 using an NVIDIA A100-SXM4-40GB GPU, CUDA 12.1, and PyTorch 2.5.1+cu121. The optimizer was AdamW with learning rate $10^{-4}$ and weight decay $10^{-4}$, followed by cosine annealing to $10^{-6}$. The maximum training budget was 100 epochs, batch size was 12, and early stopping was applied independently within each fold with patience 30. Automatic mixed precision and gradient clipping were used during CUDA training. The final prediction pass ran as job 6685455 on a Tesla V100-SXM2-32GB GPU.
 \begin{table}[htbp]
@@ -257,21 +253,68 @@ Held-out test images with Dice $\ge 0.90$ & 5/5 \\
 \end{table}
 \begin{figure}[htbp]
 \centering
+\begin{subfigure}[t]{0.485\linewidth}
 \begin{tikzpicture}
-\begin{axis}[width=0.92\linewidth,height=7cm,xlabel={Epoch},ylabel={Validation loss},legend pos=north east,grid=both]
-\addplot[MidnightBlue, thick] table[x=epoch,y=val_loss]{figures/plots/fold1_curves.dat};
+\begin{axis}[
+  width=\linewidth, height=6.5cm,
+  xlabel={Epoch}, ylabel={Tversky loss},
+  legend pos=north east,
+  legend style={font=\tiny, cells={anchor=west}, row sep=-2pt},
+  grid=both, grid style={gray!20},
+  ymin=0
+]
+\addplot[MidnightBlue,  thick, dashed, forget plot] table[x=epoch,y=train_loss]{figures/plots/fold1_curves.dat};
+\addplot[MidnightBlue,  thick]                      table[x=epoch,y=val_loss  ]{figures/plots/fold1_curves.dat};
 \addlegendentry{Fold 1}
-\addplot[RedOrange, thick] table[x=epoch,y=val_loss]{figures/plots/fold2_curves.dat};
+\addplot[RedOrange,     thick, dashed, forget plot] table[x=epoch,y=train_loss]{figures/plots/fold2_curves.dat};
+\addplot[RedOrange,     thick]                      table[x=epoch,y=val_loss  ]{figures/plots/fold2_curves.dat};
 \addlegendentry{Fold 2}
-\addplot[ForestGreen, thick] table[x=epoch,y=val_loss]{figures/plots/fold3_curves.dat};
+\addplot[ForestGreen,   thick, dashed, forget plot] table[x=epoch,y=train_loss]{figures/plots/fold3_curves.dat};
+\addplot[ForestGreen,   thick]                      table[x=epoch,y=val_loss  ]{figures/plots/fold3_curves.dat};
 \addlegendentry{Fold 3}
-\addplot[Purple, thick] table[x=epoch,y=val_loss]{figures/plots/fold4_curves.dat};
+\addplot[Purple,        thick, dashed, forget plot] table[x=epoch,y=train_loss]{figures/plots/fold4_curves.dat};
+\addplot[Purple,        thick]                      table[x=epoch,y=val_loss  ]{figures/plots/fold4_curves.dat};
 \addlegendentry{Fold 4}
-\addplot[TealBlue, thick] table[x=epoch,y=val_loss]{figures/plots/fold5_curves.dat};
+\addplot[TealBlue,      thick, dashed, forget plot] table[x=epoch,y=train_loss]{figures/plots/fold5_curves.dat};
+\addplot[TealBlue,      thick]                      table[x=epoch,y=val_loss  ]{figures/plots/fold5_curves.dat};
 \addlegendentry{Fold 5}
 \end{axis}
 \end{tikzpicture}
-\caption{Editable PGFPlots validation-loss curves parsed from \nolinkurl{train_6670898.out}. Fold 1 achieved the lowest validation loss and was used for final held-out inference.}
+\caption{Loss (solid = val, dashed = train)}
+\label{fig:loss-curves}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.485\linewidth}
+\begin{tikzpicture}
+\begin{axis}[
+  width=\linewidth, height=6.5cm,
+  xlabel={Epoch}, ylabel={Dice coefficient},
+  legend pos=south east,
+  legend style={font=\tiny, cells={anchor=west}, row sep=-2pt},
+  grid=both, grid style={gray!20},
+  ymin=0, ymax=1
+]
+\addplot[MidnightBlue,  thick, dashed, forget plot] table[x=epoch,y=train_dice]{figures/plots/fold1_curves.dat};
+\addplot[MidnightBlue,  thick]                      table[x=epoch,y=val_dice  ]{figures/plots/fold1_curves.dat};
+\addlegendentry{Fold 1}
+\addplot[RedOrange,     thick, dashed, forget plot] table[x=epoch,y=train_dice]{figures/plots/fold2_curves.dat};
+\addplot[RedOrange,     thick]                      table[x=epoch,y=val_dice  ]{figures/plots/fold2_curves.dat};
+\addlegendentry{Fold 2}
+\addplot[ForestGreen,   thick, dashed, forget plot] table[x=epoch,y=train_dice]{figures/plots/fold3_curves.dat};
+\addplot[ForestGreen,   thick]                      table[x=epoch,y=val_dice  ]{figures/plots/fold3_curves.dat};
+\addlegendentry{Fold 3}
+\addplot[Purple,        thick, dashed, forget plot] table[x=epoch,y=train_dice]{figures/plots/fold4_curves.dat};
+\addplot[Purple,        thick]                      table[x=epoch,y=val_dice  ]{figures/plots/fold4_curves.dat};
+\addlegendentry{Fold 4}
+\addplot[TealBlue,      thick, dashed, forget plot] table[x=epoch,y=train_dice]{figures/plots/fold5_curves.dat};
+\addplot[TealBlue,      thick]                      table[x=epoch,y=val_dice  ]{figures/plots/fold5_curves.dat};
+\addlegendentry{Fold 5}
+\end{axis}
+\end{tikzpicture}
+\caption{Dice (solid = val, dashed = train)}
+\label{fig:dice-curves}
+\end{subfigure}
+\caption{Training and validation curves across all five folds, parsed from \nolinkurl{train_6670898.out}. Solid lines show validation metrics; dashed lines of the same colour show training metrics. Fold~1 (blue) reached the lowest validation loss and was selected for final held-out inference. The narrow training–validation gap across all folds indicates that the model generalises rather than memorising tile-level patterns.}
 \label{fig:val-curves}
 \end{figure}
 \section{Attention Progression During Training}
