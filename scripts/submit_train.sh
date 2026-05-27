@@ -30,6 +30,10 @@ export PYTHONUNBUFFERED=1
 
 cd /home/$USER/vessel_seg
 
+# ── W&B toggle (default: enabled) ─────────────────────────────────────────────
+# Pass USE_WANDB=0 to disable: sbatch --export=ALL,USE_WANDB=0 scripts/submit_train.sh
+[ "${USE_WANDB:-1}" = "0" ] && export WANDB_MODE=disabled && echo "W&B logging disabled"
+
 # ── Clear wandb cache to prevent disk quota issues ────────────────────────────
 rm -rf /home/$USER/.cache/wandb/
 echo "Cleared ~/.cache/wandb/"
@@ -43,6 +47,13 @@ $PYTHON -c "import torch; print(f'PyTorch {torch.__version__}  CUDA: {torch.cuda
 echo "Start:     $(date)"
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
+# PREDICT_INPUT_DIR: where predict.py looks for images — overridable via --export.
+# Training always uses data/images; predict defaults to the same unless overridden.
+PREDICT_INPUT_DIR="${INPUT_DIR:-data/images}"
+PREDICT_MASK_DIR="${MASK_DIR:-data/masks}"
+# Auto-enable inference mode when predict target is not the training data dir
+# (skips splits filtering so all images are predicted, not just the 7-image subset)
+[ "$PREDICT_INPUT_DIR" != "data/images" ] && INFERENCE_MODE=1 || true
 INPUT_DIR="data/images"
 OUTPUT_DIR="data/masks"
 
@@ -89,6 +100,6 @@ echo "Training done: $(date)"
 # a hardcoded path that could point to a different run's model.
 PREDICT_JOB=$(sbatch --parsable \
     --dependency=afterok:$SLURM_JOB_ID \
-    --export=ALL,CKPT_PATH=$CKPT_DIR/best_model.pth \
+    --export=ALL,CKPT_PATH=$CKPT_DIR/best_model.pth,INPUT_DIR=$PREDICT_INPUT_DIR,MASK_DIR=$PREDICT_MASK_DIR \
     scripts/submit_predict.sh)
 echo "Predict job submitted: $PREDICT_JOB  (checkpoint: $CKPT_DIR/best_model.pth)"

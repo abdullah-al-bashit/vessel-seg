@@ -39,6 +39,10 @@ export PYTHONUNBUFFERED=1
 
 cd /home/$USER/vessel_seg
 
+# ── W&B toggle (default: enabled) ─────────────────────────────────────────────
+# Pass USE_WANDB=0 to disable: sbatch --export=ALL,USE_WANDB=0 scripts/submit_predict.sh
+[ "${USE_WANDB:-1}" = "0" ] && export WANDB_MODE=disabled && echo "W&B logging disabled"
+
 # ── Clear wandb cache to prevent disk quota issues ────────────────────────────
 rm -rf /home/$USER/.cache/wandb/
 echo "Cleared ~/.cache/wandb/"
@@ -67,9 +71,9 @@ OUT_DIR="${OUT_DIR:-predictions}"
 # ── Predict ────────────────────────────────────────────────────────────────────
 $PYTHON src/predict.py \
     --input_dir  $INPUT_DIR  \
-    --mask_dir   $MASK_DIR   \
     --ckpt_path  $CKPT_PATH  \
     --out_dir    $OUT_DIR    \
+    ${MASK_DIR:+--mask_dir $MASK_DIR} \
     ${INFERENCE_MODE:+--inference_mode}
 
 echo "Done: $(date)"

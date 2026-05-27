@@ -9,7 +9,7 @@ Architecture: **AttentionUNet** — trainable ResNet34 encoder + UNet decoder wi
 - `AttentionGate`: soft attention on skip connections guided by decoder query
 - `AttentionUNet`: ResNet34 (timm, pretrained) → 4-level UNet decoder with attention gates + dilated refinement head
 - `visualize_attention_maps`: logs all 3 gate outputs (heatmap / overlay / alpha) to W&B
-- Graph/SAM2 code archived in `src/model_graph.py` — not imported anywhere
+
 
 ## Configuration (`configs/config.yaml`)
 Single config file — all hyperparameters live here, never hardcoded in `.py` files.
@@ -26,10 +26,16 @@ Each run copies its YAML into `checkpoints/<job_id>/config.yaml` for self-docume
   ```
 - **Submit training job**:
   ```bash
-  sbatch scripts/submit_train.sh                        # full run (200 epochs, 2 folds)
-  sbatch --export=ALL,EPOCHS=1,FOLDS=1 scripts/submit_train.sh  # 1-epoch timing test
+  sbatch scripts/submit_train.sh                                   # full run (100 epochs, 5 folds)
+  sbatch --export=ALL,EPOCHS=5,FOLDS=1 scripts/submit_train.sh    # 1-fold timing test
+  sbatch --export=ALL,USE_WANDB=0 scripts/submit_train.sh         # disable W&B
+  sbatch --export=ALL,WARMSTART_CKPT=checkpoints/<id>/best_model.pth scripts/submit_train.sh  # warmstart
   ```
-- Predict job is auto-queued as a dependent job (`--dependency=afterok`).
+- **Submit predict on inference data** (no masks, mirrors subfolder structure):
+  ```bash
+  sbatch --export=ALL,CKPT_PATH=checkpoints/<id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR=,USE_WANDB=0 scripts/submit_predict.sh
+  ```
+- Predict job is auto-queued as a dependent job (`--dependency=afterok`). When `INPUT_DIR` is not `data/images`, `INFERENCE_MODE=1` is set automatically.
 - Each job writes to `checkpoints/<SLURM_JOB_ID>/` — no checkpoint collisions.
 - **Do NOT** load the system CUDA module — PyTorch ships its own CUDA/cuDNN.
 
@@ -44,17 +50,18 @@ Each run copies its YAML into `checkpoints/<job_id>/config.yaml` for self-docume
 |------|---------|
 | `src/train.py` | Training loop, CV folds, W&B logging, calls `print_cv_summary` at end |
 | `src/model.py` | `AttentionUNet` + `AttentionGate` + `visualize_attention_maps` |
-| `src/model_graph.py` | Archived VesselSegNet + graph path — not used |
+
 | `src/dataset.py` | `VesselDataset` — tiling, sharpness, gradient magnitude, augmentation |
-| `src/loss.py` | `VesselLoss` — Dice + BCE hard-neg + clDice + sharpness boundary + contrastive |
-| `src/predict.py` | Full-image inference: tile → forward → stitch → W&B media log |
+| `src/loss.py` | `VesselLoss` — Tversky + clDice (λ=0) + skeleton density (λ=0); all independently weighted |
+| `src/predict.py` | Full-image inference: tile → forward → stitch → W&B media log; `--inference_mode` predicts all images and mirrors subfolder structure |
 | `src/summarize_cv.py` | `print_cv_summary()` — publication-ready CV table, called directly from train.py |
-| `configs/config.yaml` | Single experiment config (AttentionUNet, 2-fold CV, 200 epochs) |
-| `scripts/submit_train.sh` | SLURM train job — override with `EPOCHS=`, `FOLDS=`, `BATCH_SIZE=` |
-| `scripts/submit_predict.sh` | SLURM predict job — auto-queued after training |
+| `configs/config.yaml` | Single experiment config (AttentionUNet, 5-fold CV, 100 epochs, patience 30) |
+| `scripts/submit_train.sh` | SLURM train job — override with `EPOCHS=`, `FOLDS=`, `BATCH_SIZE=`, `USE_WANDB=0`, `WARMSTART_CKPT=` |
+| `scripts/submit_predict.sh` | SLURM predict job — auto-queued after training; override `INPUT_DIR=`, `MASK_DIR=`, `USE_WANDB=0` |
 
 ## W&B
 - Entity: `eeebashit`, Project: `vessel-seg`
-- Per-epoch metrics: `fold{N}/train_{loss,dice,bce,cldice,boundary,contrast}`
-- Every 10 val epochs: attention maps (heatmap, overlay, alpha) for all 3 gates
-- Predict run: originals, prediction overlay, gt, tp/fp/fn, combined, attention maps
+- Per-epoch metrics: `fold{N}/train_{loss,dice,tversky,cldice,skel_density}`, `fold{N}/val_{loss,dice,...}`
+- Test metrics: `test/{loss,dice,tversky,cldice,skel_density,dice_stitched}`
+- Predict run: originals, ch_grad, ch_sharp, prediction overlay, gt, tp/fp/fn, combined, attention maps
+- Disable with `USE_WANDB=0` in sbatch `--export` — saves ~7 min startup time per job
