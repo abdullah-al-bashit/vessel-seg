@@ -24,7 +24,7 @@
 \captionsetup{font=small,labelfont=bf}
 \newcommand{\filename}[1]{\nolinkurl{#1}}
 \title{\bfseries Blood-Vessel Segmentation in 3D Fluorescence Microscopy}
-\author{Abdullah Al Bashit,PhD}
+\author{Abdullah Al Bashit, PhD}
 \date{}
 \begin{document}
 \maketitle
@@ -172,7 +172,7 @@ Sharpness (VoL) & $S$ & Variance of Laplacian in a $64{\times}64$ local window &
 \end{table}
 
 \subsection{Data Augmentation}
-Augmentation was applied \textbf{online} (on-the-fly): at the start of each training epoch, the DataLoader loads each base tile and passes it through a stochastic transform pipeline before feeding it to the model. The original pixel array is never seen — only its randomly-transformed version. Because each epoch draws a fresh independent random transform for every tile, the model is never exposed to the same pixel array twice across the 46 training epochs, giving 48\,300 unique augmented views from 1\,050 base tiles. Validation and test tiles bypass this pipeline entirely and are always evaluated on the original unmodified tiles.
+Augmentation was applied \textbf{online} (on-the-fly): at the start of each training epoch, the DataLoader loads each base tile and passes it through a stochastic transform pipeline before feeding it to the model. The original pixel array is never seen in its raw form, as only its randomly-transformed version is fed to the model. Because each epoch draws a fresh independent random transform for every tile, the model is never exposed to the same pixel array twice across the 46 training epochs, giving 48\,300 unique augmented views from 1\,050 base tiles. Validation and test tiles bypass this pipeline entirely and are always evaluated on the original unmodified tiles.
 
 Geometric transforms were applied identically to both image and mask to preserve label alignment; intensity transforms were applied to the image only. Table~\ref{tab:augmentation} lists each transform with its probability and parameter range.
 
@@ -183,8 +183,8 @@ Geometric transforms were applied identically to both image and mask to preserve
 \toprule
 Augmentation & Prob. & Parameters & Purpose \\
 \midrule
-Horizontal flip & 0.50 & --- & Left--right symmetry \\
-Vertical flip & 0.50 & --- & Top--bottom symmetry \\
+Horizontal flip & 0.50 & -- & Left--right symmetry \\
+Vertical flip & 0.50 & -- & Top--bottom symmetry \\
 90$^\circ$ rotation ($k\in\{1,2,3\}$) & 0.75 & Resized back to original tile & Rotational invariance \\
 Random zoom crop & 0.50 & Scale $\in[0.75,\,1.0]$ & Scale variation \\
 Elastic deformation & 0.30 & $\alpha=h\cdot U(0.5,2)$;\; $\sigma=0.08h$ & Vessel curvature variation \\
@@ -406,7 +406,7 @@ where $x_l$ is the encoder skip feature, $g_l$ is the decoder gating signal, and
 \toprule
 Stage & Layer & Output shape & Ch. & Notes \\
 \midrule
-\multicolumn{5}{l}{\textit{Encoder — ResNet34 (ImageNet pretrained, fully trainable)}} \\
+\multicolumn{5}{l}{\textit{Encoder: ResNet34 (ImageNet pretrained, fully trainable)}} \\
 Input & 3-channel stack $[I,G,S]$ & $(B,3,H,W)$ & 3 & Grayscale, gradient, sharpness \\
 $e_0$ & Stem conv $7{\times}7$ + pool & $(B,64,H/2,W/2)$ & 64 & Finest scale \\
 $e_1$ & ResNet layer 1 (3 blocks) & $(B,64,H/4,W/4)$ & 64 & \\
@@ -414,7 +414,7 @@ $e_2$ & ResNet layer 2 (4 blocks) & $(B,128,H/8,W/8)$ & 128 & \\
 $e_3$ & ResNet layer 3 (6 blocks) & $(B,256,H/16,W/16)$ & 256 & \\
 $e_4$ & ResNet layer 4 (3 blocks) & $(B,512,H/32,W/32)$ & 512 & Bottleneck \\
 \midrule
-\multicolumn{5}{l}{\textit{Decoder — ConvTranspose2d upsampling with attention-gated skip connections}} \\
+\multicolumn{5}{l}{\textit{Decoder: ConvTranspose2d upsampling with attention-gated skip connections}} \\
 $d_4$ & ConvT $2{\times}2$ s=2 + att1($e_3$) & $(B,256,H/16,W/16)$ & 256 & Gates $e_3$ \\
 $d_3$ & ConvT $2{\times}2$ s=2 + att2($e_2$) & $(B,128,H/8,W/8)$ & 128 & Gates $e_2$ \\
 $d_2$ & ConvT $2{\times}2$ s=2 + att3($e_1$) & $(B,64,H/4,W/4)$ & 64 & Gates $e_1$ \\
@@ -426,11 +426,11 @@ Refine 1 & Conv $5{\times}5$, dilation=2, pad=4 & $(B,32,H,W)$ & 32 & $9{\times}
 Refine 2 & Conv $3{\times}3$, dilation=1, pad=1 & $(B,16,H,W)$ & 16 & Boundary sharpening \\
 Head & Conv $1{\times}1$ + sigmoid & $(B,1,H,W)$ & 1 & Vessel probability \\
 \midrule
-\multicolumn{5}{l}{\textit{Attention gates — $F_g$: gating channels; $F_l$: skip channels; $F_{int}$: intermediate channels}} \\
-att0 & $H/2$ scale & $(B,32,H/2,W/2)$ & --- & $F_g{=}32,\;F_l{=}32,\;F_{int}{=}16$ \\
-att1 & $H/16$ scale & $(B,256,H/16,W/16)$ & --- & $F_g{=}256,\;F_l{=}256,\;F_{int}{=}128$ \\
-att2 & $H/8$ scale & $(B,128,H/8,W/8)$ & --- & $F_g{=}128,\;F_l{=}128,\;F_{int}{=}64$ \\
-att3 & $H/4$ scale & $(B,64,H/4,W/4)$ & --- & $F_g{=}64,\;F_l{=}64,\;F_{int}{=}32$ \\
+\multicolumn{5}{l}{\textit{Attention gates ($F_g$: gating channels; $F_l$: skip channels; $F_{int}$: intermediate channels)}} \\
+att0 & $H/2$ scale & $(B,32,H/2,W/2)$ & -- & $F_g{=}32,\;F_l{=}32,\;F_{int}{=}16$ \\
+att1 & $H/16$ scale & $(B,256,H/16,W/16)$ & -- & $F_g{=}256,\;F_l{=}256,\;F_{int}{=}128$ \\
+att2 & $H/8$ scale & $(B,128,H/8,W/8)$ & -- & $F_g{=}128,\;F_l{=}128,\;F_{int}{=}64$ \\
+att3 & $H/4$ scale & $(B,64,H/4,W/4)$ & -- & $F_g{=}64,\;F_l{=}64,\;F_{int}{=}32$ \\
 \bottomrule
 \end{tabular}
 \label{tab:architecture}
@@ -536,10 +536,10 @@ This second factor additionally down-weights blurred or out-of-focus regions, co
 % Inference note
 \node[draw=ForestGreen!50, fill=ForestGreen!8, rounded corners, align=center,
       font=\tiny, minimum width=5cm]
-  at (3.4, 0.0) {At \textbf{inference}: tile predictions\\are averaged in the overlap zone.\\No gate — stitched output is seamless.};
+  at (3.4, 0.0) {At \textbf{inference}: tile predictions\\are averaged in the overlap zone.\\No gate; stitched output is seamless.};
 \end{tikzpicture}
 \end{minipage}
-\caption{Hann boundary gate. \textbf{Left:} Gate profile $h(u)=\tfrac{1}{2}(1-\cos(2\pi u/T_w))$. Zero at both tile edges, 1.0 at the tile centre — so edge pixels contribute no gradient during training. \textbf{Right:} The full panoramic image is split into tiles with 50\,\% horizontal overlap (stride = $T_w/2$). Each tile's loss is weighted by $h(u)$, suppressing the contribution of boundary pixels that see artificially cut vessels. At inference the gate is not applied; overlapping tile predictions are averaged to produce a seamless stitched mask.}
+\caption{Hann boundary gate. \textbf{Left:} Gate profile $h(u)=\tfrac{1}{2}(1-\cos(2\pi u/T_w))$. Zero at both tile edges, 1.0 at the tile centre, so edge pixels contribute no gradient during training. \textbf{Right:} The full panoramic image is split into tiles with 50\,\% horizontal overlap (stride = $T_w/2$). Each tile's loss is weighted by $h(u)$, suppressing the contribution of boundary pixels that see artificially cut vessels. At inference the gate is not applied; overlapping tile predictions are averaged to produce a seamless stitched mask.}
 \label{fig:hann-gate}
 \end{figure}
 
@@ -695,10 +695,10 @@ Mean & & & 0.9399 \\
 \caption{Dice coefficient: train (dashed) and val (solid).}
 \label{fig:dice-curves}
 \end{subfigure}
-\caption{Single-fold training and validation curves from \nolinkurl{train_7084535.out}. The model converged rapidly — validation loss plateaued after epoch~16 (best checkpoint, marked). Early stopping triggered at epoch~46. The narrow train/val gap indicates the model generalises rather than memorising tile-level patterns.}
+\caption{Single-fold training and validation curves from \nolinkurl{train_7084535.out}. The model converged rapidly: validation loss plateaued after epoch~16 (best checkpoint, marked). Early stopping triggered at epoch~46. The narrow train/val gap indicates the model generalises rather than memorising tile-level patterns.}
 \label{fig:val-curves}
 \end{figure}
-\section{Inference Results — Images 117 and 132}
+\section{Inference Results: Images 117 and 132}
 Images 117 (Day 14) and 132 (Day 21) were processed in the inference job (job 7106358) using the fold 1 checkpoint. Ground-truth masks for these images were provided post-hoc, enabling TP/FP/FN overlay and Dice evaluation. Neither image appeared in the training or validation set.
 
 \begin{table}[htbp]
@@ -715,7 +715,7 @@ Image & Filename & Day & GT source & Stitched Dice \\
 \label{tab:inference-dice}
 \end{table}
 
-\subsection{Inference Image 117 (Day 14 — Dice 0.9648)}
+\subsection{Inference Image 117 (Day 14, Dice 0.9648)}
 \begin{landscape}
 \begin{figure}[p]
 \centering
@@ -731,12 +731,12 @@ Image & Filename & Day & GT source & Stitched Dice \\
 \textbf{False negative} & \includegraphics[width=0.78\linewidth]{figures/report_images/inference/117_fn.png} \\
 \textbf{TP/FP/FN overlay} & \includegraphics[width=0.78\linewidth]{figures/report_images/inference/117_combined.png} \\
 \end{tabular}
-\caption{Inference result for \nolinkurl{117_EC_D14_P1_C1_MAX_Crop.tif} (Day 14). Ground-truth mask provided post-hoc. Stitched-image Dice = 0.9648. Green = TP (predicted and confirmed vessel), red = FP (predicted background, actually vessel — none visible at this Dice), yellow = FN (missed vessel pixels).}
+\caption{Inference result for \nolinkurl{117_EC_D14_P1_C1_MAX_Crop.tif} (Day 14). Ground-truth mask provided post-hoc. Stitched-image Dice = 0.9648. Green = TP (predicted and confirmed vessel), red = FP (predicted background, actually vessel, none visible at this Dice), yellow = FN (missed vessel pixels).}
 \label{fig:inference-117}
 \end{figure}
 \end{landscape}
 
-\subsection{Inference Image 132 (Day 21 — Dice 0.9696)}
+\subsection{Inference Image 132 (Day 21, Dice 0.9696)}
 \begin{landscape}
 \begin{figure}[p]
 \centering
@@ -761,12 +761,4 @@ Image & Filename & Day & GT source & Stitched Dice \\
 The model performed well across the held-out test set: 11 of 12 test images exceeded Dice 0.90 and the mean stitched-image Dice was 0.9399. The strongest qualitative behaviour is recovery of long vessel structures despite weak contrast and local fragmentation. The lowest-scoring image (img 1, D7, Dice 0.8987) likely reflects more challenging low-contrast acquisition conditions on day 7. The engineered gradient and sharpness channels appear to support discriminability between faint vessel edges and background texture, given the rapid convergence to high Dice (epoch 16 best) on the expanded 56-image dataset.
 \section{Conclusion}
 This report packages the segmentation model, training protocol, and quantitative results into a self-contained evidence record. The model trained in a single fold on 44 images and achieved a mean stitched-image Dice of 0.9399 on 12 held-out test images, with 11 of 12 exceeding 0.90. A compact Attention U-Net with ImageNet-pretrained ResNet34 encoder, gradient and sharpness input channels, and a Hanning-gated Tversky loss generalises reliably to unseen fluorescence microscopy acquisitions.
-\section{Future Directions}
-\begin{itemize}
-\item Expand annotation coverage across additional plates, days, imaging sessions, and biological replicates.
-\item Add topology-aware losses such as clDice or skeleton-density penalties to improve continuity of faint vessel branches.
-\item Quantify graph-level vascular connectivity after segmentation, including branch count, vessel length, and fragmentation metrics.
-\item Perform external validation on microscopy sessions not used during model development.
-\item Extend the pipeline toward full 3D volumetric segmentation if z-stack annotations become available.
-\end{itemize}
 \end{document}
