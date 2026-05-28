@@ -97,7 +97,7 @@ n_folds:    5
 epochs:     100
 batch_size: 12
 lr:         0.0001
-patience:   30
+patience:   20
 
 lambda_tversky: 1.0
 lambda_cldice:  0.0   # enable for topology-aware training
@@ -157,14 +157,14 @@ Place `.tif` images on the cluster under `inference_data/` (subfolders are fine)
 
 ```bash
 # No ground-truth masks available
-sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR= scripts/submit_predict.sh
+sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR=,INFERENCE_MODE=1 scripts/submit_predict.sh
 
 # With ground-truth masks — logs per-image Dice + TP/FP/FN panels to W&B
-sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR=inference_masks scripts/submit_predict.sh
+sbatch --export=ALL,CKPT_PATH=checkpoints/<job_id>/best_model.pth,INPUT_DIR=inference_data,MASK_DIR=inference_masks,INFERENCE_MODE=1 scripts/submit_predict.sh
 ```
 
 - Processes **all** `.tif` files recursively — no split filtering
-- `INFERENCE_MODE=1` is set automatically when `INPUT_DIR` is not `data/images`
+- `INFERENCE_MODE=1` must be passed explicitly to enable inference mode
 - Output masks saved to `predictions/` as `<name>_mask.tif` (the `_mask.tif` suffix distinguishes them from training-predict outputs which use `_pred.tif`)
 - Subfolder structure inside `inference_data/` is mirrored: `inference_data/batch1/img.tif` → `predictions/batch1/img_mask.tif`
 - W&B run logs originals, gradient/sharpness channels, prediction overlays, and attention maps

@@ -250,6 +250,11 @@ def main(args):
         wandb.log(log_payload)
 
 
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+    print("GPU released — starting W&B upload")
+
     if times:
         print(f'\nInference+save timing — {len(times)} images:')
         print(f'  avg per image: {sum(times)/len(times):.1f}s')
