@@ -759,6 +759,24 @@ Image & Filename & Day & GT source & Stitched Dice \\
 
 \section{Discussion}
 The model performed well across the held-out test set: 11 of 12 test images exceeded Dice 0.90 and the mean stitched-image Dice was 0.9399. The strongest qualitative behaviour is recovery of long vessel structures despite weak contrast and local fragmentation. The lowest-scoring image (img 1, D7, Dice 0.8987) likely reflects more challenging low-contrast acquisition conditions on day 7. The engineered gradient and sharpness channels appear to support discriminability between faint vessel edges and background texture, given the rapid convergence to high Dice (epoch 16 best) on the expanded 56-image dataset.
+
 \section{Conclusion}
 This report packages the segmentation model, training protocol, and quantitative results into a self-contained evidence record. The model trained in a single fold on 44 images and achieved a mean stitched-image Dice of 0.9399 on 12 held-out test images, with 11 of 12 exceeding 0.90. A compact Attention U-Net with ImageNet-pretrained ResNet34 encoder, gradient and sharpness input channels, and a Hanning-gated Tversky loss generalises reliably to unseen fluorescence microscopy acquisitions.
+
+\section{Future Work}
+
+\textbf{1. Lightweight architecture.}
+The current model relies on a full ResNet34 encoder (${\approx}21\text{M}$ parameters). Replacing it with a lighter backbone (ResNet18, EfficientNet-B0, or MobileNetV2) would reduce GPU memory and inference time, enabling deployment on lower-resource hardware or integration into interactive annotation tools. The 3-channel input and attention-gate decoder could be retained unchanged.
+
+\textbf{2. Five-fold cross-validation.}
+Training used a single 80/20 fold on 44 annotated images. A full 5-fold cross-validation would give a more reliable estimate of generalisation performance, expose folds where day-specific imaging conditions drive variance, and reduce dependence on any single random split. The fold-level Dice distribution would also reveal whether the single-fold result of 0.9399 is representative or optimistic.
+
+\textbf{3. Ablation study.}
+Several design choices contributed to the final performance without being individually validated: the gradient-magnitude channel, the sharpness channel, the attention gates, the Hanning loss gate, and the Tversky $\beta$ setting. A controlled ablation (removing one component at a time and measuring the Dice change on the held-out test set) would confirm which components provide the largest lift and which could be removed for a simpler, equally competitive model.
+
+\textbf{4. Transfer to other vascular datasets.}
+The model was trained exclusively on this fluorescence microscopy protocol. Testing on public retinal vessel datasets (DRIVE, CHASE-DB1, STARE) or on confocal stacks from different tissue types would assess how much of the learned representation is domain-specific versus broadly applicable. Fine-tuning from the current checkpoint rather than training from scratch would test the transferability of the ImageNet-pretrained-plus-fluorescence-adapted weights.
+
+\textbf{5. Semi-supervised learning on unlabelled images.}
+The inference job processed 76 unannotated images from the same protocol. These predictions could seed a semi-supervised loop: high-confidence predictions are treated as pseudo-labels, the model is retrained on the expanded set, and pseudo-labels are updated iteratively. Given that the model already achieves Dice $>0.93$ on labelled data, the pseudo-labels for structurally similar images are likely reliable enough to bootstrap further improvement without additional manual annotation.
 \end{document}
