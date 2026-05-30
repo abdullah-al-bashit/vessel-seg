@@ -284,112 +284,236 @@ The model was an Attention U-Net with a ResNet34 encoder pretrained on ImageNet-
   bbox/.style={draw=Purple!65, fill=Purple!9, rounded corners=2pt,
                minimum width=3.2cm, minimum height=0.68cm, align=center, line width=0.65pt},
   hbox/.style={draw=ForestGreen!65, fill=ForestGreen!9, rounded corners=2pt,
-               minimum width=2.5cm, minimum height=0.62cm, align=center, line width=0.65pt},
+               minimum width=1.6cm, minimum height=0.62cm, align=center, line width=0.65pt},
   gate/.style={circle, draw=BurntOrange!80, fill=Orange!20, minimum size=0.56cm,
                font=\sffamily\tiny\bfseries, line width=0.65pt, inner sep=0pt},
   arr/.style={-{Latex[length=2.2mm,width=1.5mm]}, line width=0.68pt},
-  skip/.style={-{Latex[length=2.0mm,width=1.4mm]}, line width=0.60pt, draw=MidnightBlue!60, dashed},
+  skip/.style={-{Latex[length=2.0mm,width=1.4mm]}, line width=0.60pt,
+               draw=MidnightBlue!60, dashed},
+  qarr/.style={-{Latex[length=1.7mm,width=1.1mm]}, line width=0.48pt,
+               draw=BurntOrange!70, dashed},
+  %% label on arrow: teal for CT2d/Conv2d ops, green for refine/head ops
+  albl/.style={font=\sffamily\tiny, inner sep=1pt, fill=white,
+               text=TealBlue!80, align=center},
+  rlbl/.style={font=\sffamily\tiny, inner sep=1pt, fill=white,
+               text=ForestGreen!65, align=center},
 ]
-%% ── Encoder (left column, top → bottom) ──────────────────────────────────
-\node[ebox, minimum width=2.2cm] (inp) at (0, 7.0) {\textbf{3-ch Input}\\$[I,\;G,\;S]$};
-\node[ebox] (e0) at (0, 5.8) {$e_0$ stem,\;64 ch,\;$H/2$};
-\node[ebox] (e1) at (0, 4.6) {$e_1$ L1,\;\;64 ch,\;$H/4$};
+
+%% ── Encoder ──────────────────────────────────────────────────────────────
+\node[ebox, minimum width=2.2cm] (inp) at (0, 8.2) {\textbf{3-ch Input}\\$[I,\;G,\;S]$};
+\node[ebox] (e0) at (0, 6.6) {$e_0$ stem,\;64 ch,\;$H/2$};
+\node[ebox] (e1) at (0, 5.0) {$e_1$ L1,\;\;64 ch,\;$H/4$};
 \node[ebox] (e2) at (0, 3.4) {$e_2$ L2,\;128 ch,\;$H/8$};
-\node[ebox] (e3) at (0, 2.2) {$e_3$ L3,\;256 ch,\;$H/16$};
-%% ── Bottleneck (centre, below both stacks) ────────────────────────────────
-\node[bbox] (e4) at (4.0, 0.5) {\textbf{$e_4$ bottleneck},\;512 ch,\;$H/32$};
-%% ── Attention gates (centre column, one per skip level) ───────────────────
-\node[gate] (g3) at (4.0, 2.2) {\tiny att3};
+\node[ebox] (e3) at (0, 1.8) {$e_3$ L3,\;256 ch,\;$H/16$};
+
+%% ── Bottleneck ───────────────────────────────────────────────────────────
+\node[bbox] (e4) at (4.0, 0.4) {\textbf{$e_4$ bottleneck},\;512 ch,\;$H/32$};
+
+%% ── Attention gates ──────────────────────────────────────────────────────
+\node[gate] (g3) at (4.0, 1.8) {\tiny att1};
 \node[gate] (g2) at (4.0, 3.4) {\tiny att2};
-\node[gate] (g1) at (4.0, 4.6) {\tiny att1};
-\node[gate] (g0) at (4.0, 5.8) {\tiny att0};
-%% ── Decoder (right column, bottom → top) ──────────────────────────────────
-\node[dbox] (d3) at (8.0, 2.2) {$d_3$,\;128 ch,\;$H/8$};
-\node[dbox] (d2) at (8.0, 3.4) {$d_2$,\;\;64 ch,\;$H/4$};
-\node[dbox] (d1) at (8.0, 4.6) {$d_1$,\;\;32 ch,\;$H/2$};
-\node[dbox] (d0) at (8.0, 5.8) {$d_0$,\;\;16 ch,\;$H$};
-%% ── Refinement head + output (continuing right from d0) ───────────────────
-\node[hbox] (ref) at (11.2, 5.8) {Dilated refine ($d{=}2$)};
-\node[hbox, minimum width=2.8cm] (out) at (14.6, 5.8) {$1{\times}1$ + sigmoid\\vessel prob.};
-%% ── Encoder arrows (top → bottom) ────────────────────────────────────────
+\node[gate] (g1) at (4.0, 5.0) {\tiny att3};
+\node[gate] (g0) at (4.0, 6.6) {\tiny att0};
+
+%% ── Decoder ──────────────────────────────────────────────────────────────
+\node[dbox] (d4) at (8.0, 1.8) {$d_4$,\;256 ch,\;$H/16$};
+\node[dbox] (d3) at (8.0, 3.4) {$d_3$,\;128 ch,\;$H/8$};
+\node[dbox] (d2) at (8.0, 5.0) {$d_2$,\;\;64 ch,\;$H/4$};
+\node[dbox] (d1) at (8.0, 6.6) {$d_1$,\;\;32 ch,\;$H/2$};
+\node[dbox] (d0) at (8.0, 8.2) {$d_0$,\;\;16 ch,\;$H$};
+
+%% ── Refinement head: single block in main diagram ────────────────────────
+\node[hbox, minimum width=2.8cm] (refhead) at (12.8, 8.2)
+     {\textbf{Refine + Head}\\$16 \to 1$\,ch,\;$\sigma$};
+
+%% d0 → combined refine+head block
+\draw[arr] (d0) -- (refhead);
+
+%% dashed pointer from block down to the inset (visual "see detail" connector)
+\draw[gray!45, dashed, line width=0.5pt, -{Latex[length=1.8mm,width=1.2mm]}]
+     (refhead.south) -- ++(0, -1.0)
+     node[below, font=\sffamily\tiny, gray!60]{see inset $\rightarrow$};
+
+%% ── proj_e0: 1×1 Conv2d 64→32 ───────────────────────────────────────────
+\node[draw=gray!55, fill=gray!8, rounded corners=1.5pt, minimum width=1.5cm,
+      minimum height=0.44cm, align=center, inner sep=2pt, line width=0.55pt,
+      font=\sffamily\tiny] (proj0) at (2.7, 6.6) {proj $64{\to}32$};
+
+%% ── Addition nodes ───────────────────────────────────────────────────────
+\node[circle, draw=gray!65, fill=white, minimum size=0.52cm, line width=0.6pt,
+      inner sep=0pt, font=\sffamily\scriptsize] (a43) at (6.0, 2.6) {$+$};
+\node[circle, draw=gray!65, fill=white, minimum size=0.52cm, line width=0.6pt,
+      inner sep=0pt, font=\sffamily\scriptsize] (a32) at (6.0, 4.2) {$+$};
+\node[circle, draw=gray!65, fill=white, minimum size=0.52cm, line width=0.6pt,
+      inner sep=0pt, font=\sffamily\scriptsize] (a21) at (6.0, 5.8) {$+$};
+\node[circle, draw=gray!65, fill=white, minimum size=0.52cm, line width=0.6pt,
+      inner sep=0pt, font=\sffamily\scriptsize] (a10) at (6.0, 7.4) {$+$};
+
+%% ── Encoder arrows ───────────────────────────────────────────────────────
 \draw[arr] (inp) -- (e0);
 \draw[arr] (e0)  -- (e1);
 \draw[arr] (e1)  -- (e2);
 \draw[arr] (e2)  -- (e3);
-%% ── Encoder → bottleneck (down from e3, right to e4 — left arm of U) ──────
+
+%% ── Encoder stage labels: anchor=east at x=-0.8, clear of side label ─────
+\node[albl, anchor=east, align=right] at (-0.8, 7.35)
+     {Conv2d $7{\times}7$,\;$s{=}2$,\;$3{\to}64$\\BN + ReLU + MaxPool};
+\node[albl, anchor=east, align=right] at (-0.8, 5.75)
+     {2${\times}$ BasicBlock\;$64{\to}64$};
+\node[albl, anchor=east, align=right] at (-0.8, 4.15)
+     {2${\times}$ BasicBlock\;$64{\to}128$,\;$s{=}2$};
+\node[albl, anchor=east, align=right] at (-0.8, 2.55)
+     {2${\times}$ BasicBlock\;$128{\to}256$,\;$s{=}2$};
+\node[albl, anchor=east, align=right] at (-0.8, 1.10)
+     {2${\times}$ BasicBlock\;$256{\to}512$,\;$s{=}2$};
+
+%% ── Bottleneck path: e3 → e4 → d4
+%%    CT2d label sits left of the vertical leg (x=8, clear of all other paths) ─
 \draw[arr] (e3.south) |- (e4.west);
-%% ── Bottleneck → decoder (right from e4, up to d3 — right arm of U) ───────
-\draw[arr] (e4.east) -| (d3.south);
-%% ── Skip connections: encoder → attention gate (dashed) ───────────────────
-\draw[skip] (e3.east) -- (g3.west);
-\draw[skip] (e2.east) -- (g2.west);
-\draw[skip] (e1.east) -- (g1.west);
-\draw[skip] (e0.east) -- (g0.west);
-%% ── Attention gate → decoder (gated skip merged into decoder state) ────────
-\draw[arr] (g3.east) -- (d3.west);
-\draw[arr] (g2.east) -- (d2.west);
-\draw[arr] (g1.east) -- (d1.west);
-\draw[arr] (g0.east) -- (d0.west);
-%% ── Decoder chain (bottom → top) ─────────────────────────────────────────
-\draw[arr] (d3) -- (d2);
-\draw[arr] (d2) -- (d1);
-\draw[arr] (d1) -- (d0);
-\draw[arr] (d0) -- (ref);
-\draw[arr] (ref) -- (out);
+\draw[arr] (e4.east)  -| node[pos=0.72, left, albl]{CT2d\\$512{\to}256$} (d4.south);
+
+%% ── Skip connections ─────────────────────────────────────────────────────
+\draw[skip] (e3.east)    -- (g3.west);
+\draw[skip] (e2.east)    -- (g2.west);
+\draw[skip] (e1.east)    -- (g1.west);
+\draw[skip] (e0.east)    -- (proj0.west);
+%% Conv2d 1×1 label: pos=0.2 keeps it over the proj0→gate left half, clear of att0
+\draw[skip] (proj0.east) -- node[pos=0.2, above, albl]{Conv2d $1{\times}1$} (g0.west);
+
+%% ── Gating-signal arrows: decoder d_n → gate (same y, enters gate.east) ──
+%% Label only on the first (most visible) arrow; others unlabelled for clarity.
+\draw[qarr] (d4.west) -- node[pos=0.35, below, font=\sffamily\tiny,
+            BurntOrange!70]{gating signal $g$} (g3.east);
+\draw[qarr] (d3.west) -- (g2.east);
+\draw[qarr] (d2.west) -- (g1.east);
+\draw[qarr] (d1.west) -- (g0.east);
+
+%% ── Gate → sum (gate exits north, L-turn right to + west) ───────────────
+\draw[arr] (g3.north) |- (a43.west);
+\draw[arr] (g2.north) |- (a32.west);
+\draw[arr] (g1.north) |- (a21.west);
+\draw[arr] (g0.north) |- (a10.west);
+
+%% ── Decoder state → sum (d_n exits north, L-turn left to + east) ─────────
+\draw[arr] (d4.north) |- (a43.east);
+\draw[arr] (d3.north) |- (a32.east);
+\draw[arr] (d2.north) |- (a21.east);
+\draw[arr] (d1.north) |- (a10.east);
+
+%% ── Sum → next decoder (sum exits north, L-turn right to d_{n+1} west)
+%%    CT2d label: pos=0.25 on |- path lands on the vertical leg;
+%%    anchor=east (= "left") places text in the open space between
+%%    the gate column (x≈4.3) and the + node (x≈5.7) — no arrows there ────
+%%    pos=0.2 puts the label solidly on the short vertical leg, clear of blocks
+\draw[arr] (a43.north) |- node[pos=0.2, left, albl]{CT2d\\$256{\to}128$} (d3.west);
+\draw[arr] (a32.north) |- node[pos=0.2, left, albl]{CT2d\\$128{\to}64$}  (d2.west);
+\draw[arr] (a21.north) |- node[pos=0.2, left, albl]{CT2d\\$64{\to}32$}   (d1.west);
+\draw[arr] (a10.north) |- node[pos=0.2, left, albl]{CT2d\\$32{\to}16$}   (d0.west);
+
+%% ── (refine detail is in the right inset) ────────────────────────────────
+
 %% ── Side labels ───────────────────────────────────────────────────────────
-\node[rotate=90,  font=\sffamily\tiny, text=MidnightBlue!80] at (-1.9, 4.6) {ResNet34 encoder};
-\node[rotate=270, font=\sffamily\tiny, text=BurntOrange!80]  at ( 9.8, 4.0) {UNet decoder};
-%% ── Attention Gate detail inset (right of main U-Net) ─────────────────────
-\draw[gray!30, dashed, line width=0.5pt] (17.0, 0.0) -- (17.0, 7.2);
-\node[font=\sffamily\tiny\bfseries, gray!75, align=center] at (20.5, 7.5)
+\node[rotate=90,  font=\sffamily\tiny, text=MidnightBlue!80] at (-5.8, 5.0)
+     {ResNet34 encoder (pretrained)};
+\node[rotate=270, font=\sffamily\tiny, text=BurntOrange!80]  at ( 9.8, 5.0)
+     {UNet decoder};
+
+%% ── BasicBlock footnote (below encoder labels, left margin) ─────────────
+\node[draw=gray!40, fill=gray!5, rounded corners=2pt, align=left,
+      font=\sffamily\tiny, inner sep=4pt, line width=0.5pt,
+      text width=3.6cm] at (-2.8, -0.5) {%
+  \textbf{BasicBlock} (ResNet34):\\
+  Conv2d $3{\times}3$ + BN + ReLU\\
+  Conv2d $3{\times}3$ + BN\\
+  $+$ residual skip\\
+  ReLU};
+
+%% ══════════════════════════════════════════════════════════════════════════
+%% ── Attention Gate inset ─────────────────────────────────────────────────
+%% ══════════════════════════════════════════════════════════════════════════
+\draw[gray!30, dashed, line width=0.5pt] (20.0, 0.0) -- (20.0, 8.8);
+\node[font=\sffamily\tiny\bfseries, gray!75, align=center] at (23.5, 9.0)
      {Attention Gate};
-%% Input nodes
-\node[ebox, minimum width=1.8cm, font=\sffamily\tiny] (al_xl) at (18.8, 7.0)
+
+\node[ebox, minimum width=1.8cm, font=\sffamily\tiny] (al_xl) at (22.2, 8.2)
      {$x_l$ (skip)};
-\node[ebox, minimum width=1.8cm, font=\sffamily\tiny] (al_gl) at (22.2, 7.0)
+\node[ebox, minimum width=1.8cm, font=\sffamily\tiny] (al_gl) at (25.6, 8.2)
      {$g_l$ (query)};
-%% Conv boxes
+
 \node[draw=gray!55, fill=gray!8, rounded corners=1.5pt, minimum width=1.0cm,
       minimum height=0.44cm, align=center, inner sep=2pt, line width=0.55pt,
-      font=\sffamily\tiny] (awx) at (18.8, 6.1) {$W_x$};
+      font=\sffamily\tiny] (awx) at (22.2, 7.1) {$W_x$};
 \node[draw=gray!55, fill=gray!8, rounded corners=1.5pt, minimum width=1.0cm,
       minimum height=0.44cm, align=center, inner sep=2pt, line width=0.55pt,
-      font=\sffamily\tiny] (awg) at (22.2, 6.1) {$W_g$};
-%% Add + ReLU + psi + sigma
+      font=\sffamily\tiny] (awg) at (25.6, 7.1) {$W_g$};
+
 \node[circle, draw=gray!60, fill=white, minimum size=0.52cm, line width=0.6pt,
-      inner sep=0pt, font=\sffamily\small] (asum)  at (20.5, 5.1) {$\oplus$};
+      inner sep=0pt, font=\sffamily\small] (asum)  at (23.9, 6.0) {$\oplus$};
 \node[draw=gray!55, fill=gray!8, rounded corners=1.5pt, minimum width=1.2cm,
       minimum height=0.44cm, align=center, inner sep=2pt, line width=0.55pt,
-      font=\sffamily\tiny] (arelu) at (20.5, 4.1) {ReLU};
+      font=\sffamily\tiny] (arelu) at (23.9, 4.9) {ReLU};
 \node[draw=gray!55, fill=gray!8, rounded corners=1.5pt, minimum width=1.4cm,
       minimum height=0.44cm, align=center, inner sep=2pt, line width=0.55pt,
-      font=\sffamily\tiny] (apsi)  at (20.5, 3.1) {$\psi_l$ (1$\times$1)};
+      font=\sffamily\tiny] (apsi)  at (23.9, 3.8) {$\psi_l$ (1$\times$1)};
 \node[circle, draw=gray!60, fill=white, minimum size=0.52cm, line width=0.6pt,
-      inner sep=0pt, font=\sffamily\small] (asig)  at (20.5, 2.1) {$\sigma$};
-%% Multiply (output)
+      inner sep=0pt, font=\sffamily\small] (asig)  at (23.9, 2.7) {$\sigma$};
 \node[circle, draw=ForestGreen!70, fill=ForestGreen!9, minimum size=0.52cm,
-      line width=0.65pt, inner sep=0pt, font=\sffamily\small] (amul) at (20.5, 1.1) {$\odot$};
-%% Arrows: inputs → conv boxes
+      line width=0.65pt, inner sep=0pt, font=\sffamily\small] (amul) at (23.9, 1.5) {$\odot$};
+
 \draw[arr, gray!70] (al_xl) -- (awx);
 \draw[arr, gray!70] (al_gl) -- (awg);
-%% Conv boxes → sum (awx from left, awg from right)
 \draw[arr, gray!70] (awx.east) |- (asum.west);
 \draw[arr, gray!70] (awg.west) |- (asum.east);
-%% Main chain
 \draw[arr, gray!70] (asum)  -- (arelu);
 \draw[arr, gray!70] (arelu) -- (apsi);
 \draw[arr, gray!70] (apsi)  -- (asig);
 \draw[arr, gray!70] (asig)  -- node[right, font=\sffamily\tiny, gray!80]
      {$\alpha_l$} (amul);
-%% x_l bypass: up and over left of W_x, then down, then into multiply
-\draw[skip, gray!55] (al_xl.south) -- (18.8, 6.6) -- (17.7, 6.6)
-     -- (17.7, 1.1) -- (amul.west);
-%% Output x̃_l
+\draw[skip, gray!55] (al_xl.south) -- (22.2, 7.65) -- (21.1, 7.65)
+     -- (21.1, 1.5) -- (amul.west);
 \draw[arr, gray!70] (amul.east) -- node[above, font=\sffamily\tiny,
      ForestGreen!75] {$\tilde{x}_l$} ++(1.0, 0);
+
+%% ── Dilated Refine Head inset ────────────────────────────────────────────
+%% ══════════════════════════════════════════════════════════════════════════
+\draw[gray!30, dashed, line width=0.5pt] (28.0, 0.0) -- (28.0, 8.8);
+\node[font=\sffamily\tiny\bfseries, gray!75, align=center] at (31.0, 9.0)
+     {Dilated Refine Head};
+
+\tikzset{rbox/.style={draw=gray!55, fill=gray!8, rounded corners=1.5pt,
+         minimum width=2.6cm, minimum height=0.48cm, align=center,
+         inner sep=2pt, line width=0.55pt, font=\sffamily\tiny}}
+
+%% nodes top→bottom, y spaced by 1.1 from 8.2
+\node[ebox, minimum width=2.4cm, font=\sffamily\tiny] (ri0) at (31.0, 8.2)
+     {$d_0$ input,\;16\,ch,\;$H{\times}W$};
+\node[rbox] (ri1) at (31.0, 7.0)
+     {Conv2d $5{\times}5$,\;$d{=}2$,\;$p{=}4$\\$16{\to}32$\,ch\quad RF\;$9{\times}9$};
+\node[rbox, minimum width=1.2cm] (ri2) at (31.0, 5.9) {ReLU};
+\node[rbox] (ri3) at (31.0, 4.8)
+     {Conv2d $3{\times}3$,\;$d{=}1$,\;$p{=}1$\\$32{\to}16$\,ch};
+\node[rbox] (ri4) at (31.0, 3.7)
+     {Conv2d $1{\times}1$\\$16{\to}1$\,ch\quad(head)};
+\node[circle, draw=gray!60, fill=white, minimum size=0.52cm, line width=0.6pt,
+      inner sep=0pt, font=\sffamily\small] (ri5) at (31.0, 2.7) {$\sigma$};
+\node[hbox, minimum width=2.4cm, font=\sffamily\tiny] (ri6) at (31.0, 1.7)
+     {vessel prob.,\;1\,ch};
+
+\draw[arr, gray!70] (ri0) -- node[right, font=\sffamily\tiny, gray!55]
+     {$(B,16,H,W)$} (ri1);
+\draw[arr, gray!70] (ri1) -- node[right, font=\sffamily\tiny, gray!55]
+     {$(B,32,H,W)$} (ri2);
+\draw[arr, gray!70] (ri2) -- node[right, font=\sffamily\tiny, gray!55]
+     {$(B,32,H,W)$} (ri3);
+\draw[arr, gray!70] (ri3) -- node[right, font=\sffamily\tiny, gray!55]
+     {$(B,16,H,W)$} (ri4);
+\draw[arr, gray!70] (ri4) -- node[right, font=\sffamily\tiny, gray!55]
+     {$(B,1,H,W)$}  (ri5);
+\draw[arr, gray!70] (ri5) -- (ri6);
+
 \end{tikzpicture}%
 }
-\caption{Attention U-Net (U-shape, left) with attention gate detail (right). \textbf{Left:} The ResNet34 encoder (blue) processes input downward to the bottleneck ($e_4$, 512\,ch, $H/32$) at the base of the U; the decoder (orange) upsamples back to full resolution. At each of the four finer scales a dashed skip routes encoder features through an attention gate before merging into the decoder. A dilated refinement head and $1{\times}1$ sigmoid projection produce the vessel-probability map. \textbf{Right:} Inside each attention gate, the encoder skip $x_l$ and decoder query $g_l$ are projected by $W_x$ and $W_g$, summed, passed through ReLU, a scalar $1{\times}1$ convolution $\psi_l$, and sigmoid to produce attention coefficients $\alpha_l$. The gated skip $\tilde{x}_l = \alpha_l \odot x_l$ (dashed bypass) is then fused with the upsampled decoder state.}
+\caption{Attention U-Net with attention gate and dilated refine head detail. \textbf{Left:} The ResNet34 encoder (blue) descends from a Conv2d $7{\times}7$ stem through four BasicBlock stages to the bottleneck ($e_4$, 512\,ch, $H/32$); stage operations are annotated on each encoder arrow. Each decoder upsampling arrow is labelled with its \emph{ConvTranspose2d} channel mapping (all $k{=}2$, $s{=}2$). The $e_0$ skip passes through a $1{\times}1$ Conv2d ($64{\to}32$) before the gate. \textbf{Centre inset:} Inside each attention gate, the encoder skip $x_l$ and decoder query $g_l$ are projected by $W_x$ and $W_g$, summed, passed through ReLU, $\psi_l$, and sigmoid to give $\alpha_l$; the gated skip $\tilde{x}_l = \alpha_l \odot x_l$ is fused with the decoder state. \textbf{Right inset:} The dilated refine head applies Conv2d $5{\times}5$ ($d{=}2$, RF $9{\times}9$, $16{\to}32$), ReLU, Conv2d $3{\times}3$ ($d{=}1$, $32{\to}16$), a $1{\times}1$ head Conv2d ($16{\to}1$), and sigmoid to produce the final vessel-probability map.}
 \label{fig:architecture-simple}
 \end{figure}
 
